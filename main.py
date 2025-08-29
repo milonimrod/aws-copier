@@ -2,8 +2,9 @@
 
 import asyncio
 import logging
-import signal
 import sys
+import os
+import signal
 from pathlib import Path
 
 from aws_copier.core.file_listener import FileListener
@@ -25,10 +26,11 @@ class AWSCopierApp:
         """Initialize application."""
         self.config = load_config()
         self.s3_manager = S3Manager(self.config)
-        # Simplified components that write directly to discovered files folder
-        self.file_listener = FileListener(self.config)
-        self.folder_watcher = FolderWatcher(self.config)
+        # Incremental backup components
+        self.file_listener = FileListener(self.config, self.s3_manager)
+        self.folder_watcher = FolderWatcher(self.config, self.file_listener)  # Real-time monitoring
         self.running = False
+        self.shutdown_event = asyncio.Event()
 
     async def start(self):
         """Start the application."""
@@ -36,34 +38,38 @@ class AWSCopierApp:
 
         try:
             # Setup signal handlers
-            self._setup_signal_handlers()
 
             # Initialize S3 manager
             await self.s3_manager.initialize()
             logger.info("✅ S3 Manager initialized")
 
-            # Run initial scan of all folders (writes to discovered files folder)
+            # Run incremental backup scan of all folders
             await self.file_listener.scan_all_folders()
-            logger.info("✅ File Listener completed initial scan -> discovered files")
+            
+            # self._setup_signal_handlers()
 
-            # Start folder watcher for real-time monitoring (writes to discovered files folder)
+            stats = self.file_listener.get_statistics()
+            logger.info(f"✅ Incremental backup completed: {stats}")
+
+            # Start folder watcher for real-time monitoring
             await self.folder_watcher.start()
-            logger.info("✅ Folder Watcher started -> discovered files")
+            logger.info("✅ Folder Watcher started")
 
             self.running = True
             logger.info("🚀 AWS Copier started successfully")
 
-            # Main status loop - show discovered files
+            # Main status loop - show backup statistics  
             while self.running:
-                # Count discovered files
-                discovered_folder = self.config.discovered_files_folder
-                if discovered_folder.exists():
-                    discovered_files = list(discovered_folder.glob("*.json"))
-                    logger.info(f"📊 Status: {len(discovered_files)} discovered files in {discovered_folder}")
-                else:
-                    logger.info("📊 Status: No discovered files folder yet")
+                stats = self.file_listener.get_statistics()
+                logger.info(f"📊 Backup Status: {stats}")
                 
-                await asyncio.sleep(30)  # Status update every 30 seconds
+                # Wait for shutdown event or timeout (5 minutes)
+                try:
+                    await asyncio.wait_for(self.shutdown_event.wait(), timeout=300)
+                    break  # Shutdown event was set
+                except asyncio.TimeoutError:
+                    # Timeout reached, continue loop for next status update
+                    continue
 
         except KeyboardInterrupt:
             logger.info("Received interrupt signal")
@@ -101,9 +107,27 @@ class AWSCopierApp:
         def signal_handler(signum, _):
             logger.info(f"Received signal {signum}")
             self.running = False
+            # Set the shutdown event to immediately wake up the main loop
+            if hasattr(self, 'shutdown_event'):
+                asyncio.create_task(self._set_shutdown_event())
 
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
+        # Setup signal handlers based on platform
+        if os.name == 'nt':  # Windows
+            # Windows only supports SIGINT and SIGTERM
+            signal.signal(signal.SIGINT, signal_handler)
+            # SIGTERM is not supported on Windows, but SIGBREAK is similar
+            try:
+                signal.signal(signal.SIGBREAK, signal_handler)
+            except AttributeError:
+                # SIGBREAK might not be available on all Windows versions
+                pass
+        else:  # Unix-like (macOS, Linux)
+            signal.signal(signal.SIGINT, signal_handler)
+            signal.signal(signal.SIGTERM, signal_handler)
+    
+    async def _set_shutdown_event(self):
+        """Set the shutdown event asynchronously."""
+        self.shutdown_event.set()
 
 
 async def main():
@@ -123,7 +147,6 @@ async def main():
             s3_bucket="your-bucket-name",
             s3_prefix="backup",
             watch_folders=[str(Path.home() / "Documents")],
-            batch_folder="./batches",
         )
 
         # Save example config
