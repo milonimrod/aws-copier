@@ -8,7 +8,6 @@ from typing import Dict
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
-from aws_copier.core.queue_manager import QueueManager
 from aws_copier.models.simple_config import SimpleConfig
 
 logger = logging.getLogger(__name__)
@@ -17,15 +16,15 @@ logger = logging.getLogger(__name__)
 class FileChangeHandler(FileSystemEventHandler):
     """Handles file system change events."""
 
-    def __init__(self, queue_manager: QueueManager, watch_folder: Path):
+    def __init__(self, config: SimpleConfig, watch_folder: Path):
         """Initialize file change handler.
         
         Args:
-            queue_manager: Queue manager to send files to
+            config: Application configuration 
             watch_folder: Root folder being watched
         """
         super().__init__()
-        self.queue_manager = queue_manager
+        self.config = config
         self.watch_folder = watch_folder
 
         # File extensions and patterns to ignore (same as FileListener)
@@ -56,23 +55,45 @@ class FileChangeHandler(FileSystemEventHandler):
             if not file_path.exists():
                 return
 
-            # Add file to queue asynchronously
-            asyncio.create_task(self._add_file_to_queue(file_path))
+            # Write file to discovered files folder asynchronously
+            asyncio.create_task(self._write_discovered_file(file_path, event.event_type))
 
         except Exception as e:
             logger.error(f"Error handling file system event: {e}")
 
-    async def _add_file_to_queue(self, file_path: Path) -> None:
-        """Add file to queue asynchronously.
+    async def _write_discovered_file(self, file_path: Path, event_type: str) -> None:
+        """Write a single discovered file to the discovered files folder.
         
         Args:
-            file_path: Path to file to add to queue
+            file_path: Path to file that was discovered
+            event_type: Type of file system event (created, modified)
         """
         try:
-            await self.queue_manager.add_file(file_path)
-            logger.debug(f"Added file to queue from watcher: {file_path}")
+            # Ensure discovered files folder exists
+            self.config.discovered_files_folder.mkdir(parents=True, exist_ok=True)
+            
+            # Create unique filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            filename = f"watcher_{event_type}_{timestamp}.json"
+            output_path = self.config.discovered_files_folder / filename
+
+            # Prepare data to write
+            data = {
+                "timestamp": datetime.now().isoformat(),
+                "source": f"watcher_{self.watch_folder.name}",
+                "type": "single_file",
+                "event_type": event_type,
+                "file": str(file_path),
+                "watch_folder": str(self.watch_folder)
+            }
+
+            with open(output_path, 'w') as f:
+                json.dump(data, f, indent=2)
+            
+            logger.debug(f"Wrote {event_type} file from watcher to {output_path}: {file_path}")
+            
         except Exception as e:
-            logger.error(f"Error adding file to queue: {e}")
+            logger.error(f"Error writing discovered file {file_path}: {e}")
 
     def _should_ignore_file(self, file_path: Path) -> bool:
         """Check if a file should be ignored.
@@ -98,17 +119,15 @@ class FileChangeHandler(FileSystemEventHandler):
 
 
 class FolderWatcher:
-    """Watches folders for real-time file changes."""
+    """Watches folders for real-time file changes and writes them to discovered files folder."""
 
-    def __init__(self, config: SimpleConfig, queue_manager: QueueManager):
+    def __init__(self, config: SimpleConfig):
         """Initialize folder watcher.
         
         Args:
             config: Application configuration
-            queue_manager: Queue manager to send files to
         """
         self.config = config
-        self.queue_manager = queue_manager
         self.observer = Observer()
         self.handlers: Dict[str, FileChangeHandler] = {}
         self.running = False
@@ -117,7 +136,7 @@ class FolderWatcher:
         self._stats = {
             "watched_folders": 0,
             "events_processed": 0,
-            "files_queued": 0
+            "files_written": 0
         }
 
     async def start(self) -> None:
@@ -169,7 +188,7 @@ class FolderWatcher:
             return
 
         # Create event handler
-        handler = FileChangeHandler(self.queue_manager, folder_path)
+        handler = FileChangeHandler(self.config, folder_path)
 
         # Add to observer
         try:

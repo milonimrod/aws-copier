@@ -22,10 +22,9 @@ class SimpleConfig:
         watch_folders_data = kwargs.get("watch_folders", [str(Path.home() / "Documents")])
         self.watch_folders: List[Path] = [Path(p) for p in watch_folders_data]
 
-        # Batch processing
-        batch_folder_data = kwargs.get("batch_folder", str(Path.home() / ".aws-copier" / "batches"))
-        self.batch_folder: Path = Path(batch_folder_data)
-        self.batch_save_interval: int = kwargs.get("batch_save_interval", 2)
+        # File discovery output
+        discovered_files_folder_data = kwargs.get("discovered_files_folder", str(Path.home() / ".aws-copier" / "discovered"))
+        self.discovered_files_folder: Path = Path(discovered_files_folder_data)
 
         # Upload settings
         self.max_concurrent_uploads: int = kwargs.get("max_concurrent_uploads", 100)
@@ -50,8 +49,7 @@ class SimpleConfig:
             "s3_bucket": self.s3_bucket,
             "s3_prefix": self.s3_prefix,
             "watch_folders": [str(p) for p in self.watch_folders],
-            "batch_folder": str(self.batch_folder),
-            "batch_save_interval": self.batch_save_interval,
+            "discovered_files_folder": str(self.discovered_files_folder),
             "max_concurrent_uploads": self.max_concurrent_uploads
         }
 
@@ -62,7 +60,7 @@ class SimpleConfig:
 
     def create_directories(self) -> None:
         """Create necessary directories."""
-        self.batch_folder.mkdir(parents=True, exist_ok=True)
+        self.discovered_files_folder.mkdir(parents=True, exist_ok=True)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary."""
@@ -73,8 +71,7 @@ class SimpleConfig:
             "s3_bucket": self.s3_bucket,
             "s3_prefix": self.s3_prefix,
             "watch_folders": [str(p) for p in self.watch_folders],
-            "batch_folder": str(self.batch_folder),
-            "batch_save_interval": self.batch_save_interval,
+            "discovered_files_folder": str(self.discovered_files_folder),
             "max_concurrent_uploads": self.max_concurrent_uploads
         }
 

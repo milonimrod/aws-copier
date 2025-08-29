@@ -1,28 +1,27 @@
 """File listener for initial directory scanning."""
 
 import asyncio
+import json
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import List
 
-from aws_copier.core.queue_manager import QueueManager
 from aws_copier.models.simple_config import SimpleConfig
 
 logger = logging.getLogger(__name__)
 
 
 class FileListener:
-    """Scans directories and subdirectories for files and sends them to QueueManager."""
+    """Scans directories and subdirectories for files and writes them to discovered files folder."""
 
-    def __init__(self, config: SimpleConfig, queue_manager: QueueManager):
+    def __init__(self, config: SimpleConfig):
         """Initialize file listener.
         
         Args:
             config: Application configuration
-            queue_manager: Queue manager to send found files to
         """
         self.config = config
-        self.queue_manager = queue_manager
 
         # File extensions and patterns to ignore
         self.ignore_patterns = {
@@ -53,10 +52,14 @@ class FileListener:
         }
 
     async def scan_all_folders(self) -> None:
-        """Scan all configured watch folders and add files to queue."""
+        """Scan all configured watch folders and write found files to discovered files folder."""
         logger.info("Starting initial scan of all watch folders")
 
+        # Ensure discovered files folder exists
+        self.config.discovered_files_folder.mkdir(parents=True, exist_ok=True)
+
         total_files = 0
+        all_discovered_files = []
 
         for folder_path in self.config.watch_folders:
             if not folder_path.exists():
@@ -68,26 +71,29 @@ class FileListener:
                 continue
 
             logger.info(f"Scanning folder: {folder_path}")
-            files_found = await self._scan_folder(folder_path)
-            total_files += files_found
+            folder_files = await self._scan_folder(folder_path)
+            all_discovered_files.extend(folder_files)
+            total_files += len(folder_files)
 
-            logger.info(f"Found {files_found} files in {folder_path}")
+            logger.info(f"Found {len(folder_files)} files in {folder_path}")
+
+        # Write all discovered files to a single batch file
+        if all_discovered_files:
+            await self._write_discovered_files(all_discovered_files, "initial_scan")
 
         logger.info(f"Initial scan completed. Total files found: {total_files}")
 
-    async def _scan_folder(self, folder_path: Path) -> int:
+    async def _scan_folder(self, folder_path: Path) -> List[str]:
         """Scan a single folder recursively.
         
         Args:
             folder_path: Path to folder to scan
             
         Returns:
-            Number of files found and queued
+            List of file paths found
         """
-        files_found = 0
-        batch_files: List[Path] = []
-        batch_size = 1000  # Process files in batches to avoid memory issues
-
+        discovered_files = []
+        
         try:
             # Use rglob to recursively find all files
             for file_path in folder_path.rglob("*"):
@@ -111,31 +117,50 @@ class FileListener:
                     self._stats["ignored_files"] += 1
                     continue
 
-                # Add to batch
-                batch_files.append(file_path)
-                files_found += 1
-
-                # Process batch when it reaches the batch size
-                if len(batch_files) >= batch_size:
-                    await self.queue_manager.add_files(batch_files)
-                    self._stats["queued_files"] += len(batch_files)
-                    logger.debug(f"Queued batch of {len(batch_files)} files")
-                    batch_files.clear()
+                # Add to discovered files list
+                discovered_files.append(str(file_path))
 
                 # Yield control occasionally to prevent blocking
-                if files_found % 100 == 0:
+                if len(discovered_files) % 100 == 0:
                     await asyncio.sleep(0)
-
-            # Process remaining files in the final batch
-            if batch_files:
-                await self.queue_manager.add_files(batch_files)
-                self._stats["queued_files"] += len(batch_files)
-                logger.debug(f"Queued final batch of {len(batch_files)} files")
 
         except Exception as e:
             logger.error(f"Error scanning folder {folder_path}: {e}")
 
-        return files_found
+        return discovered_files
+
+    async def _write_discovered_files(self, files: List[str], source: str) -> None:
+        """Write discovered files to the discovered files folder.
+        
+        Args:
+            files: List of file paths to write
+            source: Source identifier (e.g., 'initial_scan', folder name)
+        """
+        if not files:
+            return
+
+        # Create unique filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filename = f"{source}_{timestamp}.json"
+        output_path = self.config.discovered_files_folder / filename
+
+        # Prepare data to write
+        data = {
+            "timestamp": datetime.now().isoformat(),
+            "source": source,
+            "type": "file_list",
+            "files": files,
+            "count": len(files)
+        }
+
+        try:
+            with open(output_path, 'w') as f:
+                json.dump(data, f, indent=2)
+            
+            logger.info(f"Wrote {len(files)} files from {source} to {output_path}")
+            
+        except Exception as e:
+            logger.error(f"Failed to write discovered files to {output_path}: {e}")
 
     def _should_ignore_file(self, file_path: Path) -> bool:
         """Check if a file should be ignored.

@@ -6,10 +6,8 @@ import signal
 import sys
 from pathlib import Path
 
-from aws_copier.core.batch_processor import BatchProcessor
 from aws_copier.core.file_listener import FileListener
 from aws_copier.core.folder_watcher import FolderWatcher
-from aws_copier.core.queue_manager import QueueManager
 from aws_copier.core.s3_manager import S3Manager
 from aws_copier.models.simple_config import SimpleConfig, load_config
 
@@ -27,12 +25,9 @@ class AWSCopierApp:
         """Initialize application."""
         self.config = load_config()
         self.s3_manager = S3Manager(self.config)
-        self.queue_manager = QueueManager(self.config)
-        self.file_listener = FileListener(self.config, self.queue_manager)
-        self.folder_watcher = FolderWatcher(self.config, self.queue_manager)
-        self.batch_processor = BatchProcessor(
-            self.config, self.s3_manager, self.queue_manager
-        )
+        # Simplified components that write directly to discovered files folder
+        self.file_listener = FileListener(self.config)
+        self.folder_watcher = FolderWatcher(self.config)
         self.running = False
 
     async def start(self):
@@ -47,36 +42,27 @@ class AWSCopierApp:
             await self.s3_manager.initialize()
             logger.info("✅ S3 Manager initialized")
 
-            # Start queue manager
-            await self.queue_manager.start()
-            logger.info("✅ Queue Manager started")
-
-            # Start batch processor
-            await self.batch_processor.start()
-            logger.info("✅ Batch Processor started")
-
-            # Run initial scan of all folders
+            # Run initial scan of all folders (writes to discovered files folder)
             await self.file_listener.scan_all_folders()
-            logger.info("✅ File Listener completed initial scan")
+            logger.info("✅ File Listener completed initial scan -> discovered files")
 
-            # Start folder watcher for real-time monitoring
+            # Start folder watcher for real-time monitoring (writes to discovered files folder)
             await self.folder_watcher.start()
-            logger.info("✅ Folder Watcher started (real-time monitoring)")
+            logger.info("✅ Folder Watcher started -> discovered files")
 
             self.running = True
             logger.info("🚀 AWS Copier started successfully")
 
-            # Main status loop
+            # Main status loop - show discovered files
             while self.running:
-                queue_stats = self.queue_manager.get_statistics()
-                processor_stats = self.batch_processor.get_statistics()
-
-                logger.info(
-                    f"📊 Status: Queue={queue_stats['total_queued_files']} files, "
-                    f"Processing={processor_stats['active_uploads']}/{self.config.max_concurrent_uploads} uploads, "
-                    f"Uploaded={processor_stats['files_uploaded']}, "
-                    f"Failed={processor_stats['files_failed']}"
-                )
+                # Count discovered files
+                discovered_folder = self.config.discovered_files_folder
+                if discovered_folder.exists():
+                    discovered_files = list(discovered_folder.glob("*.json"))
+                    logger.info(f"📊 Status: {len(discovered_files)} discovered files in {discovered_folder}")
+                else:
+                    logger.info("📊 Status: No discovered files folder yet")
+                
                 await asyncio.sleep(30)  # Status update every 30 seconds
 
         except KeyboardInterrupt:
@@ -95,18 +81,12 @@ class AWSCopierApp:
         self.running = False
 
         try:
-            # Stop components in reverse order
+            # Stop components
             await self.folder_watcher.stop()
             logger.info("✅ Folder Watcher stopped")
 
             # File listener doesn't need to be stopped (no background tasks)
             logger.info("✅ File Listener complete")
-
-            await self.batch_processor.stop()
-            logger.info("✅ Batch Processor stopped")
-
-            await self.queue_manager.stop()
-            logger.info("✅ Queue Manager stopped")
 
             await self.s3_manager.close()
             logger.info("✅ S3 Manager closed")
