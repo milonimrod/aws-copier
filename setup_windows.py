@@ -22,7 +22,7 @@ def check_python_version():
 def check_uv_installed():
     """Check if uv is installed."""
     try:
-        result = subprocess.run(['uv', '--version'], capture_output=True, text=True)
+        result = subprocess.run(["uv", "--version"], capture_output=True, text=True)
         if result.returncode == 0:
             print(f"✅ uv is installed: {result.stdout.strip()}")
             return True
@@ -40,10 +40,7 @@ def install_uv():
     print("🔧 Installing uv...")
     try:
         # Download and install uv using PowerShell
-        subprocess.run([
-            'powershell', '-Command',
-            'irm https://astral.sh/uv/install.ps1 | iex'
-        ], check=True)
+        subprocess.run(["powershell", "-Command", "irm https://astral.sh/uv/install.ps1 | iex"], check=True)
         print("✅ uv installed successfully")
         return True
     except subprocess.CalledProcessError:
@@ -56,13 +53,13 @@ def setup_project():
     print("🔧 Setting up project environment...")
     try:
         # Sync dependencies
-        subprocess.run(['uv', 'sync'], check=True)
+        subprocess.run(["uv", "sync"], check=True)
         print("✅ Dependencies installed")
-        
+
         # Run tests to verify installation
-        subprocess.run(['uv', 'run', 'pytest', 'tests/unit/', '-v'], check=True)
+        subprocess.run(["uv", "run", "pytest", "tests/unit/", "-v"], check=True)
         print("✅ Tests passed")
-        
+
         return True
     except subprocess.CalledProcessError as e:
         print(f"❌ Setup failed: {e}")
@@ -75,12 +72,12 @@ def create_example_config():
     if config_path.exists():
         print(f"✅ Configuration file already exists: {config_path}")
         return True
-    
+
     print("📝 Creating example configuration...")
-    
+
     # Use Documents folder as default on Windows
     documents_path = Path.home() / "Documents"
-    
+
     config_content = f"""# AWS Copier Configuration
 aws_access_key_id: "your-access-key-id"
 aws_secret_access_key: "your-secret-access-key"
@@ -97,9 +94,9 @@ watch_folders:
 # Maximum concurrent uploads
 max_concurrent_uploads: 100
 """
-    
+
     try:
-        with open(config_path, 'w', encoding='utf-8') as f:
+        with open(config_path, "w", encoding="utf-8") as f:
             f.write(config_content)
         print(f"✅ Example configuration created: {config_path}")
         print("📝 Please edit the configuration with your AWS credentials")
@@ -112,7 +109,7 @@ max_concurrent_uploads: 100
 def create_windows_shortcuts():
     """Create Windows shortcuts and batch files."""
     print("🔧 Creating Windows shortcuts...")
-    
+
     # Create batch file to run AWS Copier
     run_script = """@echo off
 echo Starting AWS Copier...
@@ -120,7 +117,7 @@ cd /d "%~dp0"
 uv run python main.py
 pause
 """
-    
+
     # Create batch file to kill AWS Copier
     kill_script = """@echo off
 echo Stopping AWS Copier...
@@ -131,16 +128,16 @@ for /f "tokens=2" %%i in ('tasklist /fi "imagename eq python.exe" /fo table /nh 
 echo AWS Copier stopped
 pause
 """
-    
+
     try:
-        with open("run_aws_copier.bat", 'w') as f:
+        with open("run_aws_copier.bat", "w") as f:
             f.write(run_script)
         print("✅ Created run_aws_copier.bat")
-        
-        with open("stop_aws_copier.bat", 'w') as f:
+
+        with open("stop_aws_copier.bat", "w") as f:
             f.write(kill_script)
         print("✅ Created stop_aws_copier.bat")
-        
+
         return True
     except Exception as e:
         print(f"❌ Failed to create batch files: {e}")
@@ -151,38 +148,38 @@ def main():
     """Main setup function."""
     print("🚀 AWS Copier Windows Setup")
     print("=" * 40)
-    
+
     # Check Python version
     if not check_python_version():
         return 1
-    
+
     # Check if uv is installed
     if not check_uv_installed():
-        if input("Install uv automatically? (y/N): ").lower().startswith('y'):
+        if input("Install uv automatically? (y/N): ").lower().startswith("y"):
             if not install_uv():
                 return 1
         else:
             print("Please install uv manually and run this script again")
             return 1
-    
+
     # Setup project
     if not setup_project():
         return 1
-    
+
     # Create configuration
     if not create_example_config():
         return 1
-    
+
     # Create Windows shortcuts
     if not create_windows_shortcuts():
         return 1
-    
+
     print("\n🎉 Setup completed successfully!")
     print("\nNext steps:")
     print("1. Edit config.yaml with your AWS credentials")
     print("2. Double-click run_aws_copier.bat to start")
     print("3. Use stop_aws_copier.bat to stop the service")
-    
+
     return 0
 
 

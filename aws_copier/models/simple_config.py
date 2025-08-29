@@ -23,7 +23,9 @@ class SimpleConfig:
         self.watch_folders: List[Path] = [Path(p) for p in watch_folders_data]
 
         # File discovery output
-        discovered_files_folder_data = kwargs.get("discovered_files_folder", str(Path.home() / ".aws-copier" / "discovered"))
+        discovered_files_folder_data = kwargs.get(
+            "discovered_files_folder", str(Path.home() / ".aws-copier" / "discovered")
+        )
         self.discovered_files_folder: Path = Path(discovered_files_folder_data)
 
         # Upload settings
@@ -50,12 +52,12 @@ class SimpleConfig:
             "s3_prefix": self.s3_prefix,
             "watch_folders": [str(p) for p in self.watch_folders],
             "discovered_files_folder": str(self.discovered_files_folder),
-            "max_concurrent_uploads": self.max_concurrent_uploads
+            "max_concurrent_uploads": self.max_concurrent_uploads,
         }
 
         config_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(config_path, 'w') as f:
+        with open(config_path, "w") as f:
             yaml.dump(data, f, default_flow_style=False, indent=2)
 
     def create_directories(self) -> None:
@@ -72,7 +74,7 @@ class SimpleConfig:
             "s3_prefix": self.s3_prefix,
             "watch_folders": [str(p) for p in self.watch_folders],
             "discovered_files_folder": str(self.discovered_files_folder),
-            "max_concurrent_uploads": self.max_concurrent_uploads
+            "max_concurrent_uploads": self.max_concurrent_uploads,
         }
 
 

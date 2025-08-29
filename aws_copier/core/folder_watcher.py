@@ -18,12 +18,13 @@ logger = logging.getLogger(__name__)
 class FileChangeHandler(FileSystemEventHandler):
     """Handles file system change events."""
 
-    def __init__(self, config: SimpleConfig, watch_folder: Path, file_listener: FileListener, 
-                 event_loop: asyncio.BaseEventLoop):
+    def __init__(
+        self, config: SimpleConfig, watch_folder: Path, file_listener: FileListener, event_loop: asyncio.BaseEventLoop
+    ):
         """Initialize file change handler.
-        
+
         Args:
-            config: Application configuration 
+            config: Application configuration
             watch_folder: Root folder being watched
             file_listener: FileListener instance for processing changed files
             event_loop: Event loop to schedule async tasks
@@ -36,24 +37,43 @@ class FileChangeHandler(FileSystemEventHandler):
         # File extensions and patterns to ignore (same as FileListener)
         self.ignore_patterns = {
             # System files (cross-platform)
-            '.DS_Store', 'Thumbs.db', 'desktop.ini',
+            ".DS_Store",
+            "Thumbs.db",
+            "desktop.ini",
             # Windows system files
-            'hiberfil.sys', 'pagefile.sys', 'swapfile.sys',
-            '$RECYCLE.BIN', 'System Volume Information',
+            "hiberfil.sys",
+            "pagefile.sys",
+            "swapfile.sys",
+            "$RECYCLE.BIN",
+            "System Volume Information",
             # Temporary files
-            '.tmp', '.temp', '.swp', '.swo',
+            ".tmp",
+            ".temp",
+            ".swp",
+            ".swo",
             # Version control
-            '.git', '.gitignore', '.svn',
+            ".git",
+            ".gitignore",
+            ".svn",
             # IDE files
-            '.vscode', '.idea', '*.pyc', '__pycache__',
+            ".vscode",
+            ".idea",
+            "*.pyc",
+            "__pycache__",
             # OS specific (macOS)
-            '.Trashes', '.Spotlight-V100', '.fseventsd',
+            ".Trashes",
+            ".Spotlight-V100",
+            ".fseventsd",
             # Common build/cache directories
-            'node_modules', '.pytest_cache', '.coverage',
+            "node_modules",
+            ".pytest_cache",
+            ".coverage",
             # Backup files
-            '*.bak', '*.backup', '*~',
+            "*.bak",
+            "*.backup",
+            "*~",
             # Our backup info file (IMPORTANT: ignore these!)
-            '.milo_backup.info'
+            ".milo_backup.info",
         }
 
     def on_any_event(self, event: FileSystemEvent) -> None:
@@ -64,7 +84,7 @@ class FileChangeHandler(FileSystemEventHandler):
                 return
 
             # Only handle file creation and modification
-            if event.event_type not in ['created', 'modified']:
+            if event.event_type not in ["created", "modified"]:
                 return
 
             file_path = Path(event.src_path)
@@ -79,8 +99,7 @@ class FileChangeHandler(FileSystemEventHandler):
 
             # Schedule async processing using thread-safe method
             self.event_loop.call_soon_threadsafe(
-                asyncio.create_task, 
-                self._process_changed_file(file_path, event.event_type)
+                asyncio.create_task, self._process_changed_file(file_path, event.event_type)
             )
 
         except Exception as e:
@@ -88,7 +107,7 @@ class FileChangeHandler(FileSystemEventHandler):
 
     async def _process_changed_file(self, file_path: Path, event_type: str) -> None:
         """Process a changed file using incremental backup logic.
-        
+
         Args:
             file_path: Path to file that was changed
             event_type: Type of file system event (created, modified)
@@ -96,7 +115,7 @@ class FileChangeHandler(FileSystemEventHandler):
         try:
             # Get the folder containing this file
             folder_path = file_path.parent
-            
+
             # Only process files that are within our watch folders
             is_in_watch_folder = False
             for watch_folder in self.config.watch_folders:
@@ -106,15 +125,15 @@ class FileChangeHandler(FileSystemEventHandler):
                     break
                 except ValueError:
                     continue
-            
+
             if not is_in_watch_folder:
                 return
-            
+
             logger.info(f"📁 File {event_type}: {file_path}")
-            
+
             # Process just this folder using incremental backup
             await self.file_listener._process_current_folder(folder_path)
-            
+
             logger.debug(f"✅ Processed {event_type} file: {file_path}")
 
         except Exception as e:
@@ -122,22 +141,22 @@ class FileChangeHandler(FileSystemEventHandler):
 
     def _should_ignore_file(self, file_path: Path) -> bool:
         """Check if a file should be ignored.
-        
+
         Args:
             file_path: Path to file to check
-            
+
         Returns:
             True if file should be ignored, False otherwise
         """
         filename = file_path.name
 
         # Check if filename starts with dot (hidden file)
-        if filename.startswith('.'):
+        if filename.startswith("."):
             return True
 
         # Check ignore patterns
         for pattern in self.ignore_patterns:
-            if (pattern.startswith('.') and filename.endswith(pattern)) or pattern == filename:
+            if (pattern.startswith(".") and filename.endswith(pattern)) or pattern == filename:
                 return True
 
         return False
@@ -148,7 +167,7 @@ class FolderWatcher:
 
     def __init__(self, config: SimpleConfig, file_listener: FileListener):
         """Initialize folder watcher.
-        
+
         Args:
             config: Application configuration
             file_listener: FileListener instance for processing changed files
@@ -161,11 +180,7 @@ class FolderWatcher:
         self.event_loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Statistics
-        self._stats = {
-            "watched_folders": 0,
-            "events_processed": 0,
-            "files_processed": 0
-        }
+        self._stats = {"watched_folders": 0, "events_processed": 0, "files_processed": 0}
 
     async def start(self) -> None:
         """Start watching all configured folders."""
@@ -206,7 +221,7 @@ class FolderWatcher:
 
     async def _add_folder_watch(self, folder_path: Path) -> None:
         """Add a folder to the watch list.
-        
+
         Args:
             folder_path: Path to folder to watch
         """
@@ -225,11 +240,7 @@ class FolderWatcher:
 
         # Add to observer
         try:
-            watch = self.observer.schedule(
-                handler,
-                str(folder_path),
-                recursive=True
-            )
+            self.observer.schedule(handler, str(folder_path), recursive=True)
 
             folder_id = str(folder_path)
             self.handlers[folder_id] = handler
@@ -242,19 +253,19 @@ class FolderWatcher:
 
     def get_statistics(self) -> dict:
         """Get watcher statistics.
-        
+
         Returns:
             Dictionary with watcher statistics
         """
         return {
             "running": self.running,
             "observer_threads": len(self.observer.emitters) if self.observer else 0,
-            **self._stats
+            **self._stats,
         }
 
     def is_running(self) -> bool:
         """Check if folder watcher is running.
-        
+
         Returns:
             True if running, False otherwise
         """

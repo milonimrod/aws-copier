@@ -25,7 +25,7 @@ def test_simple_config_with_kwargs():
         aws_access_key_id="test-key",
         s3_bucket="test-bucket",
         max_concurrent_uploads=50,
-        watch_folders=["/tmp", "/home"]
+        watch_folders=["/tmp", "/home"],
     )
 
     assert config.aws_access_key_id == "test-key"
@@ -48,7 +48,7 @@ def test_config_save_and_load_yaml():
             s3_bucket="test-bucket",
             s3_prefix="test-prefix",
             watch_folders=["/test/folder1", "/test/folder2"],
-            max_concurrent_uploads=75
+            max_concurrent_uploads=75,
         )
 
         original_config.save_to_yaml(config_path)
@@ -71,11 +71,7 @@ def test_config_save_and_load_yaml():
 
 def test_config_to_dict():
     """Test converting config to dictionary."""
-    config = SimpleConfig(
-        aws_access_key_id="test-key",
-        s3_bucket="test-bucket",
-        watch_folders=["/tmp"]
-    )
+    config = SimpleConfig(aws_access_key_id="test-key", s3_bucket="test-bucket", watch_folders=["/tmp"])
 
     config_dict = config.to_dict()
 

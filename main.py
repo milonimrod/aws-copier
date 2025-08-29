@@ -13,9 +13,7 @@ from aws_copier.core.s3_manager import S3Manager
 from aws_copier.models.simple_config import SimpleConfig, load_config
 
 # Set up logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -45,7 +43,7 @@ class AWSCopierApp:
 
             # Run incremental backup scan of all folders
             await self.file_listener.scan_all_folders()
-            
+
             # self._setup_signal_handlers()
 
             stats = self.file_listener.get_statistics()
@@ -58,11 +56,11 @@ class AWSCopierApp:
             self.running = True
             logger.info("🚀 AWS Copier started successfully")
 
-            # Main status loop - show backup statistics  
+            # Main status loop - show backup statistics
             while self.running:
                 stats = self.file_listener.get_statistics()
                 logger.info(f"📊 Backup Status: {stats}")
-                
+
                 # Wait for shutdown event or timeout (5 minutes)
                 try:
                     await asyncio.wait_for(self.shutdown_event.wait(), timeout=300)
@@ -108,11 +106,11 @@ class AWSCopierApp:
             logger.info(f"Received signal {signum}")
             self.running = False
             # Set the shutdown event to immediately wake up the main loop
-            if hasattr(self, 'shutdown_event'):
+            if hasattr(self, "shutdown_event"):
                 asyncio.create_task(self._set_shutdown_event())
 
         # Setup signal handlers based on platform
-        if os.name == 'nt':  # Windows
+        if os.name == "nt":  # Windows
             # Windows only supports SIGINT and SIGTERM
             signal.signal(signal.SIGINT, signal_handler)
             # SIGTERM is not supported on Windows, but SIGBREAK is similar
@@ -124,7 +122,7 @@ class AWSCopierApp:
         else:  # Unix-like (macOS, Linux)
             signal.signal(signal.SIGINT, signal_handler)
             signal.signal(signal.SIGTERM, signal_handler)
-    
+
     async def _set_shutdown_event(self):
         """Set the shutdown event asynchronously."""
         self.shutdown_event.set()
@@ -153,9 +151,7 @@ async def main():
         example_config.save_to_yaml(config_path)
 
         logger.info(f"Example configuration created at {config_path}")
-        logger.info(
-            "Please edit the configuration file with your AWS credentials and restart."
-        )
+        logger.info("Please edit the configuration file with your AWS credentials and restart.")
         return 1
 
     # Start application

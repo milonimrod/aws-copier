@@ -18,7 +18,7 @@ def test_config():
         aws_secret_access_key="test-secret-key",
         aws_region="us-east-1",
         s3_bucket="test-bucket",
-        s3_prefix="test-prefix"
+        s3_prefix="test-prefix",
     )
 
 
@@ -63,7 +63,7 @@ def test_build_s3_key_with_trailing_slash():
 @pytest.mark.asyncio
 async def test_calculate_md5(s3_manager):
     """Test MD5 calculation."""
-    with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
         f.write("test content")
         test_file = Path(f.name)
 
@@ -89,7 +89,7 @@ async def test_calculate_md5_nonexistent_file(s3_manager):
 
 
 @pytest.mark.asyncio
-@patch('aws_copier.core.s3_manager.get_session')
+@patch("aws_copier.core.s3_manager.get_session")
 async def test_initialize_success(mock_get_session, test_config):
     """Test successful S3 manager initialization."""
     # Mock the session and client
@@ -100,7 +100,7 @@ async def test_initialize_success(mock_get_session, test_config):
 
     mock_session.create_client.return_value = mock_s3_client
     mock_get_session.return_value = mock_session
-    
+
     # Create S3Manager after mocking
     s3_manager = S3Manager(test_config)
     await s3_manager.initialize()
@@ -108,11 +108,11 @@ async def test_initialize_success(mock_get_session, test_config):
     # Verify session and client were created
     mock_get_session.assert_called_once()
     mock_session.create_client.assert_called_once_with(
-        's3',
+        "s3",
         aws_access_key_id="test-access-key",
         aws_secret_access_key="test-secret-key",
         region_name="us-east-1",
-        config=s3_manager._client_config
+        config=s3_manager._client_config,
     )
 
     # Verify head_bucket was called to test connection
@@ -133,7 +133,7 @@ async def test_close(s3_manager):
     # In the new AsyncExitStack pattern, close() calls client.close() and exit_stack.aclose()
     mock_client.close.assert_called_once()
     mock_exit_stack.aclose.assert_called_once()
-    
+
     # Verify cleanup
     assert s3_manager._s3_client is None
     assert s3_manager._exit_stack is None
@@ -149,7 +149,7 @@ async def test_upload_file_not_exists(s3_manager):
 
 
 @pytest.mark.asyncio
-@patch('aws_copier.core.s3_manager.get_session')
+@patch("aws_copier.core.s3_manager.get_session")
 async def test_check_exists_file_not_found(mock_get_session, s3_manager):
     """Test checking existence of file that doesn't exist in S3."""
     from botocore.exceptions import ClientError
@@ -161,8 +161,8 @@ async def test_check_exists_file_not_found(mock_get_session, s3_manager):
     mock_s3_client.__aexit__ = AsyncMock(return_value=None)
 
     # Mock 404 error
-    error_response = {'Error': {'Code': '404'}}
-    mock_s3_client.head_object.side_effect = ClientError(error_response, 'HeadObject')
+    error_response = {"Error": {"Code": "404"}}
+    mock_s3_client.head_object.side_effect = ClientError(error_response, "HeadObject")
 
     mock_session.create_client.return_value = mock_s3_client
     mock_get_session.return_value = mock_session
@@ -174,7 +174,7 @@ async def test_check_exists_file_not_found(mock_get_session, s3_manager):
 
 
 @pytest.mark.asyncio
-@patch('aws_copier.core.s3_manager.get_session')
+@patch("aws_copier.core.s3_manager.get_session")
 async def test_check_exists_file_found(mock_get_session, s3_manager):
     """Test checking existence of file that exists in S3."""
     # Mock the session and client
@@ -185,14 +185,14 @@ async def test_check_exists_file_found(mock_get_session, s3_manager):
 
     # Mock successful response
     mock_s3_client.head_object.return_value = {
-        'Metadata': {},
-        'ETag': '"d41d8cd98f00b204e9800998ecf8427e"',
-        'ContentLength': 0
+        "Metadata": {},
+        "ETag": '"d41d8cd98f00b204e9800998ecf8427e"',
+        "ContentLength": 0,
     }
 
     mock_session.create_client.return_value = mock_s3_client
     mock_get_session.return_value = mock_session
-    
+
     # Set the client directly for the persistent pattern
     s3_manager._s3_client = mock_s3_client
 
@@ -201,7 +201,7 @@ async def test_check_exists_file_found(mock_get_session, s3_manager):
 
 
 @pytest.mark.asyncio
-@patch('aws_copier.core.s3_manager.get_session')
+@patch("aws_copier.core.s3_manager.get_session")
 async def test_check_exists_with_md5_match(mock_get_session, s3_manager):
     """Test checking existence with MD5 verification - match."""
     # Mock the session and client
@@ -213,14 +213,14 @@ async def test_check_exists_with_md5_match(mock_get_session, s3_manager):
     # Mock successful response with matching MD5
     test_md5 = "d41d8cd98f00b204e9800998ecf8427e"
     mock_s3_client.head_object.return_value = {
-        'Metadata': {'md5-checksum': test_md5},
-        'ETag': f'"{test_md5}"',
-        'ContentLength': 0
+        "Metadata": {"md5-checksum": test_md5},
+        "ETag": f'"{test_md5}"',
+        "ContentLength": 0,
     }
 
     mock_session.create_client.return_value = mock_s3_client
     mock_get_session.return_value = mock_session
-    
+
     # Set the client directly for the persistent pattern
     s3_manager._s3_client = mock_s3_client
 
@@ -229,7 +229,7 @@ async def test_check_exists_with_md5_match(mock_get_session, s3_manager):
 
 
 @pytest.mark.asyncio
-@patch('aws_copier.core.s3_manager.get_session')
+@patch("aws_copier.core.s3_manager.get_session")
 async def test_check_exists_with_md5_mismatch(mock_get_session, s3_manager):
     """Test checking existence with MD5 verification - mismatch."""
     # Mock the session and client
@@ -242,9 +242,9 @@ async def test_check_exists_with_md5_mismatch(mock_get_session, s3_manager):
     stored_md5 = "d41d8cd98f00b204e9800998ecf8427e"
     expected_md5 = "different_md5_hash_value_here"
     mock_s3_client.head_object.return_value = {
-        'Metadata': {'md5-checksum': stored_md5},
-        'ETag': f'"{stored_md5}"',
-        'ContentLength': 0
+        "Metadata": {"md5-checksum": stored_md5},
+        "ETag": f'"{stored_md5}"',
+        "ContentLength": 0,
     }
 
     mock_session.create_client.return_value = mock_s3_client
