@@ -1,0 +1,9 @@
+aws_access_key_id: your-access-key-id
+aws_region: us-east-1
+aws_secret_access_key: your-secret-access-key
+discovered_files_folder: /Users/nimrodmilo/.aws-copier/discovered
+max_concurrent_uploads: 100
+s3_bucket: your-bucket-name
+s3_prefix: backup
+watch_folders:
+- /Users/nimrodmilo/Documents
