@@ -1,0 +1,41 @@
+{
+    // Using uv for Python environment management.
+    // No explicit VSCode settings are required for uv itself,
+    // but ensure your interpreter points to the correct environment.
+    // If you use uv venv, select the corresponding Python interpreter in VSCode.
+
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}/aws_copier/*",
+        "${workspaceFolder}/aws_copier"
+    ],
+    "terminal.integrated.env.osx": {
+        "PYTHONPATH": "${workspaceFolder}"
+    },
+    "ruff.enable": true,
+    "debugpy.debugJustMyCode": false,
+    "pythonTestExplorer.testFramework": "pytest",
+    "python.testing.pytestEnabled": true,
+    "python.testing.unittestEnabled": false,
+    "python.testing.nosetestsEnabled": false,
+    "python.testing.pytestArgs": [
+        "tests",
+        "-v",
+        "--rootdir=${workspaceFolder}"
+    ],
+    "editor.codeActionsOnSave": {
+        "source.fixAll.ruff": "explicit"
+    },
+    "python.testing.debugPort": 3000,
+    "python.testing.autoTestDiscoverOnSaveEnabled": true,
+    "python.terminal.activateEnvironment": true,
+    "python.analysis.typeCheckingMode": "basic",
+    "python.testing.cwd": "${workspaceFolder}",
+    "python.testing.pytestPath": "uv run pytest",
+    "cursorpyright.analysis.extraPaths": [
+        "${workspaceFolder}/aws_copier/*",
+        "${workspaceFolder}/aws_copier"
+    ],
+    "cursorpyright.analysis.typeCheckingMode": "basic",
+    "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+    "python.terminal.activateEnvInCurrentTerminal": true
+}
