@@ -20,6 +20,7 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.7.0",
     "pre-commit>=3.5.0",
+    "moto[s3]>=4.0.0",
 ]
 ui = [
     # tkinter is included with Python
@@ -82,6 +83,7 @@ asyncio_mode = "auto"
 
 [dependency-groups]
 dev = [
+    "moto[s3]>=4.0.0",
     "pytest>=8.4.1",
     "pytest-asyncio>=1.1.0",
 ]
