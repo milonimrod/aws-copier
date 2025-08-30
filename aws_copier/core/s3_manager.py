@@ -1,12 +1,13 @@
 """Truly async S3 manager using aiobotocore."""
 
 import asyncio
+import base64
 import contextlib
 import hashlib
 import logging
 from pathlib import Path
 import os
-from typing import Optional
+from typing import Optional, Dict
 
 from aiobotocore.session import get_session
 from aiobotocore.config import AioConfig
@@ -97,21 +98,27 @@ class S3Manager:
             # Build full S3 key with prefix
             full_s3_key = self._build_s3_key(s3_key)
 
-            # Upload file using aiobotocore (truly async)
-            with open(local_path, "rb") as f:
-                file_data = f.read()
+            # Use chunked reading for memory efficiency (especially on Windows)
+            file_size = local_path.stat().st_size
 
+            # For large files (>100MB), use multipart upload
+            if file_size > 100 * 1024 * 1024:  # 100MB
+                return await self._upload_large_file(local_path, full_s3_key, md5_hash)
+
+            # For smaller files, use regular upload with chunked reading
             client = await self._get_or_create_client()
-            await client.put_object(
-                Bucket=self.config.s3_bucket,
-                Key=full_s3_key,
-                Body=file_data,
-                Metadata={
-                    "md5-checksum": md5_hash,
-                    "original-path": str(local_path),
-                    "file-size": str(local_path.stat().st_size),
-                },
-            )
+
+            # Prepare safe metadata
+            metadata = self._prepare_metadata(local_path, md5_hash)
+
+            # Use file object directly instead of reading all into memory
+            with open(local_path, "rb") as f:
+                await client.put_object(
+                    Bucket=self.config.s3_bucket,
+                    Key=full_s3_key,
+                    Body=f,
+                    Metadata=metadata,
+                )
 
             # Verify upload by checking MD5
             if await self.check_exists(s3_key, md5_hash):
@@ -205,6 +212,143 @@ class S3Manager:
         if self.config.s3_prefix:
             return f"{self.config.s3_prefix.rstrip('/')}/{s3_key}"
         return s3_key
+
+    def _encode_metadata_value(self, value: str) -> str:
+        """Encode metadata value to be S3-safe (ASCII only).
+
+        Args:
+            value: Original metadata value
+
+        Returns:
+            ASCII-safe metadata value (base64 encoded if needed)
+        """
+        try:
+            # Try to encode as ASCII
+            value.encode("ascii")
+            return value
+        except UnicodeEncodeError:
+            # If non-ASCII characters, base64 encode
+            encoded = base64.b64encode(value.encode("utf-8")).decode("ascii")
+            return f"base64:{encoded}"
+
+    def _decode_metadata_value(self, value: str) -> str:
+        """Decode metadata value from S3-safe format.
+
+        Args:
+            value: Potentially encoded metadata value
+
+        Returns:
+            Original metadata value
+        """
+        if value.startswith("base64:"):
+            # Decode base64
+            encoded_part = value[7:]  # Remove "base64:" prefix
+            try:
+                return base64.b64decode(encoded_part).decode("utf-8")
+            except Exception:
+                # If decoding fails, return as-is
+                return value
+        return value
+
+    def _prepare_metadata(self, local_path: Path, md5_hash: str) -> Dict[str, str]:
+        """Prepare metadata dictionary with safe encoding.
+
+        Args:
+            local_path: Local file path
+            md5_hash: MD5 hash of the file
+
+        Returns:
+            Dictionary of safely encoded metadata
+        """
+        return {
+            "md5-checksum": md5_hash,
+            "original-path": self._encode_metadata_value(str(local_path)),
+            "file-size": str(local_path.stat().st_size),
+        }
+
+    async def _upload_large_file(self, local_path: Path, s3_key: str, md5_hash: str) -> bool:
+        """Upload large file using multipart upload for memory efficiency.
+
+        Args:
+            local_path: Path to local file
+            s3_key: S3 key (with prefix)
+            md5_hash: MD5 hash of the file
+
+        Returns:
+            True if upload successful, False otherwise
+        """
+        try:
+            client = await self._get_or_create_client()
+            metadata = self._prepare_metadata(local_path, md5_hash)
+
+            # Start multipart upload
+            response = await client.create_multipart_upload(
+                Bucket=self.config.s3_bucket,
+                Key=s3_key,
+                Metadata=metadata,
+            )
+            upload_id = response["UploadId"]
+
+            # Upload parts in chunks (5MB each)
+            chunk_size = 5 * 1024 * 1024  # 5MB
+            parts = []
+            part_number = 1
+
+            try:
+                with open(local_path, "rb") as f:
+                    while True:
+                        chunk = f.read(chunk_size)
+                        if not chunk:
+                            break
+
+                        # Upload part
+                        part_response = await client.upload_part(
+                            Bucket=self.config.s3_bucket,
+                            Key=s3_key,
+                            PartNumber=part_number,
+                            UploadId=upload_id,
+                            Body=chunk,
+                        )
+
+                        parts.append(
+                            {
+                                "ETag": part_response["ETag"],
+                                "PartNumber": part_number,
+                            }
+                        )
+
+                        part_number += 1
+
+                        # Log progress for large files
+                        if part_number % 10 == 0:
+                            logger.info(f"Uploaded {part_number - 1} parts for {local_path}")
+
+                # Complete multipart upload
+                await client.complete_multipart_upload(
+                    Bucket=self.config.s3_bucket,
+                    Key=s3_key,
+                    UploadId=upload_id,
+                    MultipartUpload={"Parts": parts},
+                )
+
+                logger.info(f"Large file upload successful: {local_path} -> s3://{self.config.s3_bucket}/{s3_key}")
+                return True
+
+            except Exception as e:
+                # Abort multipart upload on error
+                try:
+                    await client.abort_multipart_upload(
+                        Bucket=self.config.s3_bucket,
+                        Key=s3_key,
+                        UploadId=upload_id,
+                    )
+                except Exception:
+                    pass  # Ignore abort errors
+                raise e
+
+        except Exception as e:
+            logger.error(f"Large file upload failed for {local_path}: {e}")
+            return False
 
     async def get_object_info(self, s3_key: str) -> Optional[dict]:
         """Get S3 object information using async operations.
