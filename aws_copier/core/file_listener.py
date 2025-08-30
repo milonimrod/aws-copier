@@ -305,27 +305,39 @@ class FileListener:
         if not files_to_upload:
             return []
 
-        # Create tasks for all files
-        upload_tasks = [self._upload_single_file(filename, folder_path) for filename in files_to_upload]
+        # Create tasks for all files with timeout to prevent hanging
+        upload_tasks = []
+        for filename in files_to_upload:
+            task = asyncio.create_task(self._upload_single_file(filename, folder_path))
+            upload_tasks.append((filename, task))
 
-        # Run all uploads concurrently and gather results
+        # Run all uploads concurrently with timeout
         logger.info(f"Starting concurrent upload of {len(files_to_upload)} files (max 100 parallel)")
-        results = await asyncio.gather(*upload_tasks, return_exceptions=True)
 
-        # Filter successful uploads
         uploaded_files = []
-        for result in results:
-            if isinstance(result, Exception):
-                logger.error(f"Upload task failed with exception: {result}")
+        for filename, task in upload_tasks:
+            try:
+                # Add timeout to prevent hanging on individual files
+                result = await asyncio.wait_for(task, timeout=300)  # 5 minute timeout per file
+
+                if result:
+                    uploaded_files.append(filename)
+                    logger.debug(f"Successfully uploaded: {filename}")
+                else:
+                    logger.warning(f"Upload failed for: {filename}")
+                    self._stats["errors"] += 1
+
+            except asyncio.TimeoutError:
+                logger.error(f"Upload timeout for {filename} (5 minutes)")
                 self._stats["errors"] += 1
-            elif isinstance(result, bool) and result:
-                uploaded_files.append(result)
-            else:
-                logger.error(f"Upload task returned unexpected result: {result}")
+                task.cancel()  # Cancel the hanging task
+
+            except Exception as e:
+                logger.error(f"Upload task failed for {filename}: {e}")
                 self._stats["errors"] += 1
 
         logger.info(
-            f"Completed concurrent upload: {len(uploaded_files)} files uploaded successfully in {len(upload_tasks)} tasks"
+            f"Completed concurrent upload: {len(uploaded_files)} files uploaded successfully out of {len(files_to_upload)} total"
         )
         return uploaded_files
 

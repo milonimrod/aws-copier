@@ -113,11 +113,15 @@ class S3Manager:
 
             # Use file object directly instead of reading all into memory
             with open(local_path, "rb") as f:
-                await client.put_object(
-                    Bucket=self.config.s3_bucket,
-                    Key=full_s3_key,
-                    Body=f,
-                    Metadata=metadata,
+                # Add timeout to prevent hanging uploads
+                await asyncio.wait_for(
+                    client.put_object(
+                        Bucket=self.config.s3_bucket,
+                        Key=full_s3_key,
+                        Body=f,
+                        Metadata=metadata,
+                    ),
+                    timeout=180,  # 2 minute timeout for individual uploads
                 )
 
             # Verify upload by checking MD5
@@ -147,7 +151,11 @@ class S3Manager:
             # Use aiobotocore for truly async operation
             client = await self._get_or_create_client()
 
-            response = await client.head_object(Bucket=self.config.s3_bucket, Key=full_s3_key)
+            # Add timeout to prevent hanging
+            response = await asyncio.wait_for(
+                client.head_object(Bucket=self.config.s3_bucket, Key=full_s3_key),
+                timeout=30,  # 30 second timeout for existence checks
+            )
 
             # If no MD5 check requested, just return True (file exists)
             if expected_md5 is None:
@@ -301,13 +309,16 @@ class S3Manager:
                         if not chunk:
                             break
 
-                        # Upload part
-                        part_response = await client.upload_part(
-                            Bucket=self.config.s3_bucket,
-                            Key=s3_key,
-                            PartNumber=part_number,
-                            UploadId=upload_id,
-                            Body=chunk,
+                        # Upload part with timeout
+                        part_response = await asyncio.wait_for(
+                            client.upload_part(
+                                Bucket=self.config.s3_bucket,
+                                Key=s3_key,
+                                PartNumber=part_number,
+                                UploadId=upload_id,
+                                Body=chunk,
+                            ),
+                            timeout=120,  # 1 minute timeout per 5MB part
                         )
 
                         parts.append(
