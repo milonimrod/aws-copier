@@ -126,7 +126,7 @@ class S3Manager:
 
             # Verify upload by checking MD5
             if await self.check_exists(s3_key, md5_hash):
-                logger.info(f"Upload successful: {local_path} -> s3://{self.config.s3_bucket}/{full_s3_key}")
+                logger.debug(f"Upload successful: {local_path} -> s3://{self.config.s3_bucket}/{full_s3_key}")
                 return True
             logger.error(f"Upload verification failed for: {local_path}")
             return False
@@ -332,7 +332,7 @@ class S3Manager:
 
                         # Log progress for large files
                         if part_number % 10 == 0:
-                            logger.info(f"Uploaded {part_number - 1} parts for {local_path}")
+                            logger.debug(f"Uploaded {part_number - 1} parts for {local_path}")
 
                 # Complete multipart upload
                 await client.complete_multipart_upload(
@@ -342,7 +342,7 @@ class S3Manager:
                     MultipartUpload={"Parts": parts},
                 )
 
-                logger.info(f"Large file upload successful: {local_path} -> s3://{self.config.s3_bucket}/{s3_key}")
+                logger.debug(f"Large file upload successful: {local_path} -> s3://{self.config.s3_bucket}/{s3_key}")
                 return True
 
             except Exception as e:
