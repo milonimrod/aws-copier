@@ -121,7 +121,7 @@ class S3Manager:
                         Body=f,
                         Metadata=metadata,
                     ),
-                    timeout=180,  # 2 minute timeout for individual uploads
+                    timeout=300,
                 )
 
             # Verify upload by checking MD5
@@ -318,7 +318,7 @@ class S3Manager:
                                 UploadId=upload_id,
                                 Body=chunk,
                             ),
-                            timeout=120,  # 1 minute timeout per 5MB part
+                            timeout=300,  # 1 minute timeout per 5MB part
                         )
 
                         parts.append(
