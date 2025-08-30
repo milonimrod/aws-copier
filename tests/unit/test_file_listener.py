@@ -243,10 +243,9 @@ class TestFileListenerUploads:
 
         uploaded_files = await file_listener._upload_files(files_to_upload, temp_watch_folder)
 
-        # Note: Current implementation has a bug - it returns [True, True] instead of filenames
-        # Should return list of successfully uploaded filenames, but currently returns boolean results
+        # Fixed: Now correctly returns list of successfully uploaded filenames
         assert len(uploaded_files) == 2
-        assert all(result is True for result in uploaded_files)  # Current buggy behavior
+        assert uploaded_files == ["file1.txt", "file2.txt"]  # Correct behavior: filenames returned
 
         # Verify S3Manager was called
         assert file_listener.s3_manager.upload_file.call_count == 2
@@ -260,10 +259,10 @@ class TestFileListenerUploads:
 
         uploaded_files = await file_listener._upload_files(files_to_upload, temp_watch_folder)
 
-        # Note: Current implementation returns [True] even when skipped (bug)
-        # Should return empty list when files are skipped, but returns [True]
+        # Fixed: Now correctly returns filename when file is skipped (still considered "uploaded")
+        # When check_exists returns True, _upload_single_file returns True, so filename is included
         assert len(uploaded_files) == 1
-        assert uploaded_files[0] is True  # Current buggy behavior
+        assert uploaded_files[0] == "file1.txt"  # Correct behavior: filename returned
         file_listener.s3_manager.upload_file.assert_not_called()
 
     async def test_upload_single_file_success(self, file_listener, temp_watch_folder):
