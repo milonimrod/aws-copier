@@ -60,6 +60,9 @@ class AWSCopierGUIApp:
             for folder in self.config.watch_folders:
                 logger.info(f"  - {folder}")
 
+            # Setup signal handlers on main thread
+            self._setup_signal_handlers()
+
             # Start the main application loop in background
             self._start_background_tasks()
 
@@ -96,16 +99,17 @@ class AWSCopierGUIApp:
     def _gui_shutdown_callback(self):
         """Callback function called when GUI requests shutdown."""
         logger.info("Shutdown requested from GUI")
-        if self.loop and self.shutdown_event:
-            self.loop.call_soon_threadsafe(self.shutdown_event.set)
+        if self.loop and self.shutdown_event and not self.loop.is_closed():
+            try:
+                self.loop.call_soon_threadsafe(self.shutdown_event.set)
+            except RuntimeError:
+                # Event loop is already closed, which is fine during shutdown
+                pass
 
     async def _run_background_loop(self):
         """Run the background application loop."""
         self.running = True
         self.shutdown_event = asyncio.Event()
-
-        # Setup signal handlers for graceful shutdown
-        self._setup_signal_handlers()
 
         try:
             # Perform initial scan
@@ -143,19 +147,18 @@ class AWSCopierGUIApp:
                 self.gui.root.after(100, self.gui._close_gui)
 
     def _setup_signal_handlers(self):
-        """Setup signal handlers for graceful shutdown."""
+        """Setup signal handlers for graceful shutdown on main thread."""
 
         def signal_handler(signum, frame):
             logger.info(f"Received signal {signum}")
-            if self.shutdown_event:
-                asyncio.create_task(self._set_shutdown_event())
-
-        async def _set_shutdown_event():
-            """Set shutdown event asynchronously."""
-            if self.shutdown_event:
-                self.shutdown_event.set()
-
-        self._set_shutdown_event = _set_shutdown_event
+            # Trigger GUI shutdown which will cascade to background tasks
+            if self.gui and self.gui.running:
+                logger.info("Signal received - initiating GUI shutdown")
+                self.gui.root.after(100, self.gui._shutdown)
+            else:
+                # Fallback: directly signal background thread
+                if self.loop and self.shutdown_event:
+                    self.loop.call_soon_threadsafe(self.shutdown_event.set)
 
         # Register signal handlers based on platform
         if os.name != "nt":  # Unix-like systems (Linux, macOS)
