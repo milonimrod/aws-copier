@@ -7,5 +7,10 @@ wheels/
 *.egg-info
 .coverage
 
+# Environment files (sensitive data)
+.env
+**/.env
+*.env
+
 # Virtual environments
 .venv
