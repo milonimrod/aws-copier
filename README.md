@@ -30,8 +30,33 @@ A cross-platform daemon for real-time folder synchronization to AWS S3 with file
 
 3. Run the application:
    ```bash
+   # Console version
    uv run python main.py
+
+   # GUI version (cross-platform)
+   uv run python main_gui.py
+
+   # Test GUI with simulated logs
+   uv run python test_gui.py
    ```
+
+## GUI Features
+
+The AWS Copier includes a simple, cross-platform GUI built with Tkinter:
+
+### ✅ **Supported Platforms:**
+- **Windows** (including WSL/Ubuntu)
+- **macOS**
+- **Linux**
+
+### 🎛️ **GUI Components:**
+- **📋 Real-time log display** - Shows all application logs with auto-scroll
+- **🔴 Shutdown button** - Gracefully stops the application
+- **📦 Minimize button** - Minimizes the window
+- **🧹 Clear logs** - Clears the log display
+- **📊 Status indicator** - Shows current application status
+
+The GUI automatically captures all application logs and displays them in real-time, making it easy to monitor the backup process.
 
 ## Testing
 
