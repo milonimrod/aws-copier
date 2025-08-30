@@ -29,7 +29,7 @@ class FileListener:
         self.backup_info_filename = ".milo_backup.info"
 
         # Semaphore to limit concurrent uploads
-        self.upload_semaphore = asyncio.Semaphore(100)
+        self.upload_semaphore = asyncio.Semaphore(50)
 
         # File extensions and patterns to ignore
         self.ignore_patterns = {
@@ -165,10 +165,33 @@ class FileListener:
         # Step 4: Upload changed/new files
         uploaded_files = await self._upload_files(files_to_upload, folder_path)
 
-        # Step 5: Update backup info file if any files were uploaded
+        # Step 5: Update backup info file with successfully uploaded files only
         if uploaded_files:
-            await self._update_backup_info(backup_info_file, current_files)
-            logger.info(f"Updated backup info for {folder_path} with {len(uploaded_files)} uploaded files")
+            # Create updated backup info with only successfully uploaded files
+            updated_backup_info = existing_backup_info.copy()
+
+            # Add/update entries for successfully uploaded files
+            for filename in uploaded_files:
+                if filename in current_files:
+                    updated_backup_info[filename] = current_files[filename]
+
+            # Also include unchanged files that weren't uploaded (they're still valid)
+            for filename, md5_hash in current_files.items():
+                if filename not in files_to_upload:  # File wasn't changed, keep existing info
+                    updated_backup_info[filename] = md5_hash
+
+            await self._update_backup_info(backup_info_file, updated_backup_info)
+            logger.info(
+                f"Updated backup info for {folder_path}: {len(uploaded_files)} uploaded, {len(files_to_upload) - len(uploaded_files)} failed"
+            )
+        elif files_to_upload:
+            # Some files needed upload but none succeeded
+            logger.warning(f"No files uploaded successfully in {folder_path}, backup info not updated")
+        else:
+            # No files needed upload, but update backup info to include any new unchanged files
+            if current_files != existing_backup_info:
+                await self._update_backup_info(backup_info_file, current_files)
+                logger.info(f"Updated backup info for {folder_path} with unchanged files")
 
     async def _load_backup_info(self, backup_info_file: Path) -> Dict[str, str]:
         """Load existing backup info from .milo_backup.info file.
@@ -364,14 +387,14 @@ class FileListener:
         # Fallback: use absolute path (shouldn't happen normally)
         return str(file_path).replace("\\", "/")
 
-    async def _update_backup_info(self, backup_info_file: Path, current_files: Dict[str, str]) -> None:
-        """Update the .milo_backup.info file with current file states.
+    async def _update_backup_info(self, backup_info_file: Path, backup_files: Dict[str, str]) -> None:
+        """Update the .milo_backup.info file with successfully backed up file states.
 
         Args:
             backup_info_file: Path to backup info file
-            current_files: Current files and their MD5 hashes
+            backup_files: Files and their MD5 hashes to record as backed up
         """
-        backup_info = {"timestamp": datetime.now().isoformat(), "files": current_files}
+        backup_info = {"timestamp": datetime.now().isoformat(), "files": backup_files}
 
         try:
             with open(backup_info_file, "w", encoding="utf-8") as f:

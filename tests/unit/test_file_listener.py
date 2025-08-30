@@ -304,6 +304,52 @@ class TestFileListenerUploads:
         # Verify semaphore was used (check that upload_file was called for each file)
         assert file_listener.s3_manager.upload_file.call_count == 10
 
+    async def test_partial_upload_backup_info_update(self, file_listener, temp_watch_folder):
+        """Test that backup info only includes successfully uploaded files."""
+        # Create test files
+        test_files = ["success1.txt", "success2.txt", "fail1.txt", "fail2.txt"]
+        for filename in test_files:
+            (temp_watch_folder / filename).write_text(f"content of {filename}")
+
+        # Configure mock to simulate partial success
+        def mock_upload_side_effect(file_path, s3_key):
+            filename = file_path.name
+            return filename.startswith("success")  # Only "success*" files succeed
+
+        file_listener.s3_manager.upload_file.side_effect = mock_upload_side_effect
+        file_listener.s3_manager.check_exists.return_value = False
+
+        # Process the folder
+        await file_listener._process_current_folder(temp_watch_folder)
+
+        # Check backup info file
+        backup_info_file = temp_watch_folder / ".milo_backup.info"
+        assert backup_info_file.exists()
+
+        import json
+
+        with open(backup_info_file, "r", encoding="utf-8") as f:
+            backup_info = json.load(f)
+
+        backed_up_files = backup_info["files"]
+
+        # Only successful uploads should be in backup info
+        assert "success1.txt" in backed_up_files
+        assert "success2.txt" in backed_up_files
+        assert "fail1.txt" not in backed_up_files
+        assert "fail2.txt" not in backed_up_files
+
+        # Test retry behavior - process again
+        file_listener.s3_manager.upload_file.reset_mock()
+        await file_listener._process_current_folder(temp_watch_folder)
+
+        # Should only attempt to upload the failed files
+        upload_calls = [call.args[0].name for call in file_listener.s3_manager.upload_file.call_args_list]
+        assert "success1.txt" not in upload_calls  # Already successful
+        assert "success2.txt" not in upload_calls  # Already successful
+        assert "fail1.txt" in upload_calls  # Should retry
+        assert "fail2.txt" in upload_calls  # Should retry
+
 
 class TestFileListenerUtilities:
     """Test FileListener utility functions."""
