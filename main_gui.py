@@ -31,11 +31,11 @@ class AWSCopierGUIApp:
         self.file_listener = FileListener(self.config, self.s3_manager)
         self.folder_watcher = FolderWatcher(self.config, self.file_listener)  # Real-time monitoring
         self.running = False
-        self.shutdown_event = asyncio.Event()
+        self.shutdown_event = None
 
         # GUI components
         self.gui = None
-        self.gui_thread = None
+        self.background_thread = None
         self.loop = None
 
     async def initialize(self):
@@ -51,11 +51,20 @@ class AWSCopierGUIApp:
         try:
             await self.initialize()
 
-            # Start GUI in separate thread
-            self._start_gui()
+            # Create GUI on main thread
+            self.gui = create_gui(shutdown_callback=self._gui_shutdown_callback)
 
-            # Start the main application loop
-            await self._run_main_loop()
+            # Add initial status message
+            logger.info("AWS Copier started with GUI")
+            logger.info(f"Watching {len(self.config.watch_folders)} folders")
+            for folder in self.config.watch_folders:
+                logger.info(f"  - {folder}")
+
+            # Start the main application loop in background
+            self._start_background_tasks()
+
+            # Run GUI main loop (blocking)
+            self.gui.run()
 
         except Exception as e:
             logger.error(f"Application error: {e}")
@@ -63,43 +72,37 @@ class AWSCopierGUIApp:
         finally:
             await self.cleanup()
 
-    def _start_gui(self):
-        """Start GUI in a separate thread."""
+    def _start_background_tasks(self):
+        """Start background tasks for file monitoring."""
 
-        def run_gui():
+        def run_background():
             try:
-                # Create GUI with shutdown callback
-                self.gui = create_gui(shutdown_callback=self._gui_shutdown_callback)
+                # Create new event loop for background thread
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                self.loop = loop
 
-                # Add initial status message
-                logger.info("AWS Copier started with GUI")
-                logger.info(f"Watching {len(self.config.watch_folders)} folders")
-                for folder in self.config.watch_folders:
-                    logger.info(f"  - {folder}")
-
-                # Run GUI main loop
-                self.gui.run()
-
+                # Run the background tasks
+                loop.run_until_complete(self._run_background_loop())
             except Exception as e:
-                logger.error(f"GUI error: {e}")
+                logger.error(f"Background task error: {e}")
             finally:
-                # Signal main loop to stop when GUI closes
-                if self.loop and not self.shutdown_event.is_set():
-                    self.loop.call_soon_threadsafe(self.shutdown_event.set)
+                if hasattr(self, "loop") and self.loop:
+                    self.loop.close()
 
-        self.gui_thread = threading.Thread(target=run_gui, daemon=True)
-        self.gui_thread.start()
+        self.background_thread = threading.Thread(target=run_background, daemon=True)
+        self.background_thread.start()
 
     def _gui_shutdown_callback(self):
         """Callback function called when GUI requests shutdown."""
         logger.info("Shutdown requested from GUI")
-        if self.loop:
+        if self.loop and self.shutdown_event:
             self.loop.call_soon_threadsafe(self.shutdown_event.set)
 
-    async def _run_main_loop(self):
-        """Run the main application loop."""
+    async def _run_background_loop(self):
+        """Run the background application loop."""
         self.running = True
-        self.loop = asyncio.get_running_loop()
+        self.shutdown_event = asyncio.Event()
 
         # Setup signal handlers for graceful shutdown
         self._setup_signal_handlers()
@@ -131,21 +134,26 @@ class AWSCopierGUIApp:
         except KeyboardInterrupt:
             logger.info("Received keyboard interrupt")
         except Exception as e:
-            logger.error(f"Error in main loop: {e}")
+            logger.error(f"Error in background loop: {e}")
             raise
         finally:
-            logger.info("Shutting down...")
+            logger.info("Background tasks shutting down...")
+            # Close GUI when background tasks complete
+            if self.gui and self.gui.running:
+                self.gui.root.after(100, self.gui._close_gui)
 
     def _setup_signal_handlers(self):
         """Setup signal handlers for graceful shutdown."""
 
         def signal_handler(signum, frame):
             logger.info(f"Received signal {signum}")
-            asyncio.create_task(self._set_shutdown_event())
+            if self.shutdown_event:
+                asyncio.create_task(self._set_shutdown_event())
 
         async def _set_shutdown_event():
             """Set shutdown event asynchronously."""
-            self.shutdown_event.set()
+            if self.shutdown_event:
+                self.shutdown_event.set()
 
         self._set_shutdown_event = _set_shutdown_event
 
@@ -185,7 +193,7 @@ class AWSCopierGUIApp:
         logger.info("AWS Copier shutdown complete")
 
 
-async def main():
+def main():
     """Main entry point."""
     # Check if GUI is available
     try:
@@ -202,7 +210,8 @@ async def main():
     app = AWSCopierGUIApp()
 
     try:
-        await app.run()
+        # Run the async initialization and then the GUI
+        asyncio.run(app.run())
     except KeyboardInterrupt:
         logger.info("Application interrupted")
     except Exception as e:
@@ -229,7 +238,7 @@ if __name__ == "__main__":
             max_concurrent_uploads=100,
         )
 
-        example_config.save(config_path)
+        example_config.save_to_yaml(config_path)
         logger.info(f"Example configuration saved to {config_path}")
         logger.info("Please edit the configuration file with your AWS credentials and settings")
         logger.info("Then run the application again")
@@ -237,7 +246,7 @@ if __name__ == "__main__":
 
     # Run the application
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
         logger.info("Application interrupted by user")
     except Exception as e:
