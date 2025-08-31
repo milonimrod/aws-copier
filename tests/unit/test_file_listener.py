@@ -403,6 +403,10 @@ class TestFileListenerUtilities:
         assert file_listener._should_ignore_directory(Path("__pycache__"))
         assert file_listener._should_ignore_directory(Path("node_modules"))
 
+        # Test Windows system directories
+        assert file_listener._should_ignore_directory(Path("$RECYCLE.BIN"))
+        assert file_listener._should_ignore_directory(Path("System Volume Information"))
+
         # Test directories that should not be ignored
         assert not file_listener._should_ignore_directory(Path("normal_folder"))
         assert not file_listener._should_ignore_directory(Path("Documents"))

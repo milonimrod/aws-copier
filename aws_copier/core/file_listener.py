@@ -46,8 +46,6 @@ class FileListener:
             "hiberfil.sys",
             "pagefile.sys",
             "swapfile.sys",
-            "$RECYCLE.BIN",
-            "System Volume Information",
             # Temporary files
             ".tmp",
             ".temp",
@@ -89,6 +87,9 @@ class FileListener:
             ".venv",
             "venv",
             ".aws-copier",  # Our own config folder
+            # Windows system directories
+            "$RECYCLE.BIN",
+            "System Volume Information",
         }
 
         # Statistics
