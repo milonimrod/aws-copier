@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import aiofiles
+
 from aws_copier.core.s3_manager import S3Manager
 from aws_copier.models.simple_config import SimpleConfig
 
@@ -30,6 +32,9 @@ class FileListener:
 
         # Semaphore to limit concurrent uploads
         self.upload_semaphore = asyncio.Semaphore(50)
+
+        # Separate semaphore for MD5 computation to avoid blocking uploads
+        self.md5_semaphore = asyncio.Semaphore(50)
 
         # File extensions and patterns to ignore
         self.ignore_patterns = {
@@ -214,7 +219,7 @@ class FileListener:
             return {}
 
     async def _scan_current_files(self, folder_path: Path) -> Dict[str, str]:
-        """Scan current folder and compute MD5 for all files.
+        """Scan current folder and compute MD5 for all files in parallel.
 
         Args:
             folder_path: Path to folder to scan
@@ -225,15 +230,33 @@ class FileListener:
         current_files = {}
 
         try:
+            # Collect all files to process
+            files_to_scan = []
             for file_path in folder_path.iterdir():
                 # Skip directories and ignored files
                 if file_path.is_dir() or self._should_ignore_file(file_path):
                     continue
+                files_to_scan.append(file_path)
 
-                # Compute MD5 hash
-                md5_hash = await self._calculate_md5(file_path)
-                if md5_hash:
-                    current_files[file_path.name] = md5_hash
+            if not files_to_scan:
+                return current_files
+
+            # Create tasks for parallel MD5 computation
+            md5_tasks = []
+            for file_path in files_to_scan:
+                task = asyncio.create_task(self._calculate_md5_with_semaphore(file_path))
+                md5_tasks.append((file_path.name, task))
+
+            logger.debug(f"Computing MD5 for {len(files_to_scan)} files in parallel (max 50 concurrent)")
+
+            # Gather all MD5 tasks concurrently and validate the responses
+            results = await asyncio.gather(*(task for _, task in md5_tasks), return_exceptions=True)
+            for (filename, _), result in zip(md5_tasks, results):
+                if isinstance(result, Exception):
+                    logger.error(f"Error computing MD5 for {filename}: {result}")
+                    self._stats["errors"] += 1
+                elif result:
+                    current_files[filename] = result
                     self._stats["scanned_files"] += 1
                 else:
                     self._stats["errors"] += 1
@@ -335,7 +358,7 @@ class FileListener:
             upload_tasks.append((filename, task))
 
         # Run all uploads concurrently with timeout
-        logger.info(f"Starting concurrent upload of {len(files_to_upload)} files (max 100 parallel)")
+        logger.info(f"Starting concurrent upload of {len(files_to_upload)} files (max 50 parallel)")
 
         uploaded_files = []
         for filename, task in upload_tasks:
@@ -403,8 +426,20 @@ class FileListener:
         except Exception as e:
             logger.error(f"Failed to update backup info {backup_info_file}: {e}")
 
+    async def _calculate_md5_with_semaphore(self, file_path: Path) -> Optional[str]:
+        """Calculate MD5 hash of a file with semaphore control for parallel processing.
+
+        Args:
+            file_path: Path to file
+
+        Returns:
+            MD5 hash as hex string, or None if error
+        """
+        async with self.md5_semaphore:
+            return await self._calculate_md5(file_path)
+
     async def _calculate_md5(self, file_path: Path) -> Optional[str]:
-        """Calculate MD5 hash of a file.
+        """Calculate MD5 hash of a file using aiofiles for truly async I/O.
 
         Args:
             file_path: Path to file
@@ -415,14 +450,12 @@ class FileListener:
         try:
             hasher = hashlib.md5()
 
-            def _hash_file():
-                with open(file_path, "rb") as f:
-                    while chunk := f.read(8192):
-                        hasher.update(chunk)
-                return hasher.hexdigest()
+            # Use aiofiles for truly asynchronous file I/O
+            async with aiofiles.open(file_path, "rb") as f:
+                while chunk := await f.read(8192):
+                    hasher.update(chunk)
 
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, _hash_file)
+            return hasher.hexdigest()
 
         except Exception as e:
             logger.error(f"Error calculating MD5 for {file_path}: {e}")
