@@ -6,4 +6,5 @@ max_concurrent_uploads: 100
 s3_bucket: your-bucket-name
 s3_prefix: backup
 watch_folders:
-- /Users/nimrodmilo/Documents
+  /Users/nimrodmilo/Documents: Documents
+  E:/: Pictures

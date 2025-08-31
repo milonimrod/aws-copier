@@ -401,8 +401,9 @@ class FileListener:
             try:
                 # Get relative path from watch folder
                 relative_path = file_path.relative_to(watch_folder)
-                # Use watch folder name as prefix
-                s3_key = f"{watch_folder.name}/{relative_path}"
+                # Use custom S3 name from mapping instead of folder name
+                s3_folder_name = self.config.get_s3_name_for_folder(watch_folder)
+                s3_key = f"{s3_folder_name}/{relative_path}"
                 return s3_key.replace("\\", "/")  # Ensure forward slashes
             except ValueError:
                 continue  # File not under this watch folder

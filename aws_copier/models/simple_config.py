@@ -18,9 +18,25 @@ class SimpleConfig:
         self.s3_bucket: str = kwargs.get("s3_bucket", "your-bucket-name")
         self.s3_prefix: str = kwargs.get("s3_prefix", "")
 
-        # Folders to watch
+        # Folders to watch - support both list format (legacy) and dict format (new)
         watch_folders_data = kwargs.get("watch_folders", [str(Path.home() / "Documents")])
-        self.watch_folders: List[Path] = [Path(p) for p in watch_folders_data]
+
+        if isinstance(watch_folders_data, list):
+            # Legacy format: list of folder paths
+            self.watch_folders: List[Path] = [Path(p) for p in watch_folders_data]
+            # Create default mapping using folder names
+            self.folder_s3_mapping: Dict[Path, str] = {Path(p): Path(p).name for p in watch_folders_data}
+        elif isinstance(watch_folders_data, dict):
+            # New format: dict mapping folder paths to S3 names
+            self.watch_folders: List[Path] = [Path(p) for p in watch_folders_data.keys()]
+            self.folder_s3_mapping: Dict[Path, str] = {
+                Path(folder_path): s3_name for folder_path, s3_name in watch_folders_data.items()
+            }
+        else:
+            # Fallback to default
+            default_path = Path.home() / "Documents"
+            self.watch_folders: List[Path] = [default_path]
+            self.folder_s3_mapping: Dict[Path, str] = {default_path: "Documents"}
 
         # File discovery output
         discovered_files_folder_data = kwargs.get(
@@ -50,7 +66,7 @@ class SimpleConfig:
             "aws_region": self.aws_region,
             "s3_bucket": self.s3_bucket,
             "s3_prefix": self.s3_prefix,
-            "watch_folders": [str(p) for p in self.watch_folders],
+            "watch_folders": {str(folder_path): s3_name for folder_path, s3_name in self.folder_s3_mapping.items()},
             "discovered_files_folder": str(self.discovered_files_folder),
             "max_concurrent_uploads": self.max_concurrent_uploads,
         }
@@ -64,6 +80,17 @@ class SimpleConfig:
         """Create necessary directories."""
         self.discovered_files_folder.mkdir(parents=True, exist_ok=True)
 
+    def get_s3_name_for_folder(self, folder_path: Path) -> str:
+        """Get the S3 name for a given folder path.
+
+        Args:
+            folder_path: Local folder path
+
+        Returns:
+            S3 name for the folder, or folder name as fallback
+        """
+        return self.folder_s3_mapping.get(folder_path, folder_path.name)
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary."""
         return {
@@ -72,7 +99,7 @@ class SimpleConfig:
             "aws_region": self.aws_region,
             "s3_bucket": self.s3_bucket,
             "s3_prefix": self.s3_prefix,
-            "watch_folders": [str(p) for p in self.watch_folders],
+            "watch_folders": {str(folder_path): s3_name for folder_path, s3_name in self.folder_s3_mapping.items()},
             "discovered_files_folder": str(self.discovered_files_folder),
             "max_concurrent_uploads": self.max_concurrent_uploads,
         }
