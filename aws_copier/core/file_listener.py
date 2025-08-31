@@ -130,7 +130,7 @@ class FileListener:
             if self._should_ignore_directory(folder_path):
                 return
 
-            logger.debug(f"Processing folder: {folder_path}")
+            logger.info(f"Processing folder: {folder_path}")
             self._stats["scanned_folders"] += 1
 
             # Step 1: Process current folder
@@ -503,6 +503,14 @@ class FileListener:
         if dirname.startswith("."):
             return True
 
+        try:
+            if dir_path.is_symlink():
+                return True
+            if hasattr(dir_path, "is_dir") and hasattr(dir_path, "exists"):
+                if dir_path.exists() and not dir_path.is_dir():
+                    return True
+        except Exception:
+            return False
         return False
 
     def get_statistics(self) -> dict:
