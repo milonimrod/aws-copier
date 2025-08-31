@@ -77,7 +77,8 @@ def test_config_to_dict():
 
     assert config_dict["aws_access_key_id"] == "test-key"
     assert config_dict["s3_bucket"] == "test-bucket"
-    assert config_dict["watch_folders"] == ["/tmp"]
+    # With new format, watch_folders is now a dict mapping paths to S3 names
+    assert config_dict["watch_folders"] == {"/tmp": "tmp"}
     assert config_dict["aws_region"] == "us-east-1"  # default value
 
 
