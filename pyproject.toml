@@ -9,6 +9,7 @@ dependencies = [
     "watchdog>=3.0.0", # File system monitoring
     "pyyaml>=6.0.2", # YAML configuration
     "python-dotenv>=1.1.1",
+    "aiofiles>=24.1.0",
 ]
 
 [project.optional-dependencies]
