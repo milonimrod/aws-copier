@@ -470,3 +470,90 @@ class TestFileListenerStatistics:
         assert stats["scanned_folders"] > 0
         assert stats["scanned_files"] > 0
         assert stats["uploaded_files"] >= 0
+
+
+class TestFileListenerS3KeyBuilding:
+    """Test S3 key building functionality with folder mapping."""
+
+    def test_build_s3_key_with_list_format(self, mock_s3_manager):
+        """Test S3 key building with legacy list format."""
+        config = SimpleConfig(watch_folders=["/Users/test/Documents", "/Users/test/Pictures"])
+        file_listener = FileListener(config, mock_s3_manager)
+
+        # Test file in Documents folder
+        docs_file = Path("/Users/test/Documents/subfolder/test.txt")
+        s3_key = file_listener._build_s3_key(docs_file)
+        assert s3_key == "Documents/subfolder/test.txt"
+
+        # Test file in Pictures folder
+        pics_file = Path("/Users/test/Pictures/vacation/photo.jpg")
+        s3_key = file_listener._build_s3_key(pics_file)
+        assert s3_key == "Pictures/vacation/photo.jpg"
+
+    def test_build_s3_key_with_dict_format(self, mock_s3_manager):
+        """Test S3 key building with new dictionary format."""
+        config = SimpleConfig(
+            watch_folders={"/Users/test/Documents": "MyDocuments", "E:/": "Pictures", "/home/user/videos": "Videos"}
+        )
+        file_listener = FileListener(config, mock_s3_manager)
+
+        # Test file in Documents folder with custom S3 name
+        docs_file = Path("/Users/test/Documents/work/report.pdf")
+        s3_key = file_listener._build_s3_key(docs_file)
+        assert s3_key == "MyDocuments/work/report.pdf"
+
+        # Test file in E:/ drive mapped to Pictures
+        e_drive_file = Path("E:/photos/vacation/image.jpg")
+        s3_key = file_listener._build_s3_key(e_drive_file)
+        assert s3_key == "Pictures/photos/vacation/image.jpg"
+
+        # Test file in videos folder
+        video_file = Path("/home/user/videos/movie.mp4")
+        s3_key = file_listener._build_s3_key(video_file)
+        assert s3_key == "Videos/movie.mp4"
+
+    def test_build_s3_key_with_windows_paths(self, mock_s3_manager):
+        """Test S3 key building with Windows-style paths."""
+        # Use normalized paths that work cross-platform
+        docs_path = str(Path("C:/Users/test/Documents"))
+        photos_path = str(Path("D:/Photos"))
+
+        config = SimpleConfig(watch_folders={docs_path: "Documents", photos_path: "Pictures"})
+        file_listener = FileListener(config, mock_s3_manager)
+
+        # Test file in Documents folder
+        win_file = Path(docs_path) / "folder" / "file.txt"
+        s3_key = file_listener._build_s3_key(win_file)
+        # Should use forward slashes in S3 key and map to custom name
+        assert s3_key == "Documents/folder/file.txt"
+        assert "\\" not in s3_key
+
+    def test_build_s3_key_file_not_in_watch_folders(self, mock_s3_manager):
+        """Test S3 key building for file not in any watch folder."""
+        config = SimpleConfig(watch_folders={"/Users/test/Documents": "Documents"})
+        file_listener = FileListener(config, mock_s3_manager)
+
+        # File outside watch folders should use absolute path as fallback
+        outside_file = Path("/tmp/random/file.txt")
+        s3_key = file_listener._build_s3_key(outside_file)
+        assert s3_key == "/tmp/random/file.txt"
+
+    def test_build_s3_key_nested_folders(self, mock_s3_manager):
+        """Test S3 key building with deeply nested folder structures."""
+        config = SimpleConfig(watch_folders={"/Users/test/Projects": "Development"})
+        file_listener = FileListener(config, mock_s3_manager)
+
+        # Test deeply nested file
+        nested_file = Path("/Users/test/Projects/python/aws-copier/src/main.py")
+        s3_key = file_listener._build_s3_key(nested_file)
+        assert s3_key == "Development/python/aws-copier/src/main.py"
+
+    def test_build_s3_key_root_folder_file(self, mock_s3_manager):
+        """Test S3 key building for file directly in watch folder root."""
+        config = SimpleConfig(watch_folders={"/Users/test/Documents": "MyDocs"})
+        file_listener = FileListener(config, mock_s3_manager)
+
+        # File directly in watch folder root
+        root_file = Path("/Users/test/Documents/readme.txt")
+        s3_key = file_listener._build_s3_key(root_file)
+        assert s3_key == "MyDocs/readme.txt"
