@@ -197,6 +197,7 @@ dependencies = [
     { name = "aiofiles" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
+    { name = "ruff" },
     { name = "watchdog" },
 ]
 
@@ -233,6 +234,7 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.1.0" },
     { name = "python-dotenv", specifier = ">=1.1.1" },
     { name = "pyyaml", specifier = ">=6.0.2" },
+    { name = "ruff", specifier = ">=0.12.11" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
     { name = "watchdog", specifier = ">=3.0.0" },
 ]
