@@ -30,8 +30,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Plans**: 5 plans
 
 Plans:
-- [ ] 01-01-PLAN.md — Create shared `aws_copier/core/ignore_rules.py` (IgnoreRules frozen dataclass + IGNORE_RULES singleton + tests) [IGNORE-01, IGNORE-02, IGNORE-03]
-- [ ] 01-02-PLAN.md — Config cleanup batch: fix pyproject.toml entrypoint, remove discovered_files_folder, move ruff/python-dotenv to dev deps [CONFIG-02, CONFIG-03, CONFIG-04]
+- [x] 01-01-PLAN.md — Create shared `aws_copier/core/ignore_rules.py` (IgnoreRules frozen dataclass + IGNORE_RULES singleton + tests) [IGNORE-01, IGNORE-02, IGNORE-03]
+- [x] 01-02-PLAN.md — Config cleanup batch: fix pyproject.toml entrypoint, remove discovered_files_folder, move ruff/python-dotenv to dev deps [CONFIG-02, CONFIG-03, CONFIG-04]
 - [ ] 01-03-PLAN.md — folder_watcher.py refactor: run_coroutine_threadsafe bridge, AbstractEventLoop annotation, IGNORE_RULES consumption [ASYNC-01, ASYNC-05, IGNORE-03]
 - [ ] 01-04-PLAN.md — file_listener.py refactor: gather-based concurrent uploads, aiofiles+lock state I/O, config-wired semaphore, IGNORE_RULES consumption, ignored_files stat, active-upload-task set [ASYNC-02, ASYNC-03, ASYNC-04, IGNORE-03, IGNORE-04, CONFIG-01]
 - [ ] 01-05-PLAN.md — main.py signal handling: re-enable _setup_signal_handlers, platform-aware registration, 60-second graceful drain on SIGTERM [ASYNC-06]
