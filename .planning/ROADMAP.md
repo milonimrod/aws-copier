@@ -27,7 +27,14 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. A file named `report.bak` or `script.pyc` in a watched folder is never uploaded to S3
   4. A `.env` file or SSH key (`id_rsa`, `*.pem`) in a watched folder is never uploaded to S3
   5. Sending SIGTERM to the headless daemon waits for in-flight uploads to finish before exiting, and `uv run aws-copier` launches the daemon without error
-**Plans**: TBD
+**Plans**: 5 plans
+
+Plans:
+- [ ] 01-01-PLAN.md — Create shared `aws_copier/core/ignore_rules.py` (IgnoreRules frozen dataclass + IGNORE_RULES singleton + tests) [IGNORE-01, IGNORE-02, IGNORE-03]
+- [ ] 01-02-PLAN.md — Config cleanup batch: fix pyproject.toml entrypoint, remove discovered_files_folder, move ruff/python-dotenv to dev deps [CONFIG-02, CONFIG-03, CONFIG-04]
+- [ ] 01-03-PLAN.md — folder_watcher.py refactor: run_coroutine_threadsafe bridge, AbstractEventLoop annotation, IGNORE_RULES consumption [ASYNC-01, ASYNC-05, IGNORE-03]
+- [ ] 01-04-PLAN.md — file_listener.py refactor: gather-based concurrent uploads, aiofiles+lock state I/O, config-wired semaphore, IGNORE_RULES consumption, ignored_files stat, active-upload-task set [ASYNC-02, ASYNC-03, ASYNC-04, IGNORE-03, IGNORE-04, CONFIG-01]
+- [ ] 01-05-PLAN.md — main.py signal handling: re-enable _setup_signal_handlers, platform-aware registration, 60-second graceful drain on SIGTERM [ASYNC-06]
 
 ### Phase 2: Performance & Polish
 **Goal**: Scans run faster by skipping unchanged files, credentials can come from the standard AWS provider chain, per-directory `.backupignore` files control custom exclusions, and an S3 lifecycle rule prevents orphaned multipart parts from accumulating cost
@@ -47,5 +54,5 @@ Phases execute in numeric order: 1 → 2
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Core Reliability | 0/TBD | Not started | - |
+| 1. Core Reliability | 0/5 | Not started | - |
 | 2. Performance & Polish | 0/TBD | Not started | - |
