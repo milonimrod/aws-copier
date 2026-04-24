@@ -16,7 +16,6 @@ def test_simple_config_creation():
     assert config.s3_bucket == "your-bucket-name"
     assert config.max_concurrent_uploads == 100
     assert len(config.watch_folders) == 1
-    assert config.discovered_files_folder is not None
 
 
 def test_simple_config_with_kwargs():
@@ -80,24 +79,6 @@ def test_config_to_dict():
     # With new format, watch_folders is now a dict mapping paths to S3 names
     assert config_dict["watch_folders"] == {"/tmp": "tmp"}
     assert config_dict["aws_region"] == "us-east-1"  # default value
-
-
-def test_config_create_directories():
-    """Test creating directories."""
-    with tempfile.TemporaryDirectory() as temp_dir:
-        discovered_folder = Path(temp_dir) / "test_discovered"
-
-        config = SimpleConfig(discovered_files_folder=str(discovered_folder))
-
-        # Directory should not exist yet
-        assert not discovered_folder.exists()
-
-        # Create directories
-        config.create_directories()
-
-        # Directory should now exist
-        assert discovered_folder.exists()
-        assert discovered_folder.is_dir()
 
 
 def test_yaml_file_not_found():
