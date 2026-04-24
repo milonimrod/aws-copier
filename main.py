@@ -2,9 +2,8 @@
 
 import asyncio
 import logging
-import sys
-import os
 import signal
+import sys
 from pathlib import Path
 
 from aws_copier.core.file_listener import FileListener
@@ -35,16 +34,15 @@ class AWSCopierApp:
         logger.info("Starting AWS Copier (Simplified Architecture)...")
 
         try:
-            # Setup signal handlers
-
             # Initialize S3 manager
             await self.s3_manager.initialize()
             logger.info("✅ S3 Manager initialized")
 
+            # ASYNC-06: install SIGTERM / SIGINT handlers now that the loop is running.
+            self._setup_signal_handlers()
+
             # Run incremental backup scan of all folders
             await self.file_listener.scan_all_folders()
-
-            # self._setup_signal_handlers()
 
             stats = self.file_listener.get_statistics()
             logger.info(f"✅ Incremental backup completed: {stats}")
@@ -76,22 +74,37 @@ class AWSCopierApp:
         finally:
             await self.shutdown()
 
-    async def shutdown(self):
-        """Shutdown the application."""
+    async def shutdown(self) -> None:
+        """Shutdown the application (ASYNC-06): stop the watcher, drain in-flight uploads, close S3."""
         if not self.running:
+            # shutdown may be called from the signal handler AND from the main-loop finally;
+            # short-circuit the second call.
             return
 
         logger.info("Shutting down AWS Copier...")
         self.running = False
 
         try:
-            # Stop components
+            # Step 1: stop the folder watcher so no NEW events create new upload tasks.
             await self.folder_watcher.stop()
             logger.info("✅ Folder Watcher stopped")
 
-            # File listener doesn't need to be stopped (no background tasks)
-            logger.info("✅ File Listener complete")
+            # Step 2 (ASYNC-06): drain in-flight uploads for up to 60s (D-03).
+            # Pitfall 3 guard: asyncio.wait raises ValueError on an empty set, so check first.
+            upload_tasks = set(self.file_listener._active_upload_tasks)
+            if upload_tasks:
+                logger.info(f"Draining {len(upload_tasks)} in-flight upload(s) (max 60s)")
+                done, pending = await asyncio.wait(upload_tasks, timeout=60)
+                if pending:
+                    # D-04: name each abandoned file so the user knows what the next scan cycle will re-check.
+                    for task in pending:
+                        logger.warning(f"Abandoned in-flight upload: {task.get_name()}")
+                        task.cancel()
+                logger.info(f"Drain complete: {len(done)} finished, {len(pending)} abandoned")
+            else:
+                logger.info("No in-flight uploads to drain")
 
+            # Step 3: close S3 client.
             await self.s3_manager.close()
             logger.info("✅ S3 Manager closed")
 
@@ -99,32 +112,46 @@ class AWSCopierApp:
         except Exception as e:
             logger.error(f"Error during shutdown: {e}", exc_info=True)
 
-    def _setup_signal_handlers(self):
-        """Setup signal handlers for graceful shutdown."""
+    def _setup_signal_handlers(self) -> None:
+        """Register SIGTERM/SIGINT handlers on the running asyncio loop (ASYNC-06).
 
-        def signal_handler(signum, _):
-            logger.info(f"Received signal {signum}")
-            self.running = False
-            # Set the shutdown event to immediately wake up the main loop
-            if hasattr(self, "shutdown_event"):
-                asyncio.create_task(self._set_shutdown_event())
+        Unix (sys.platform != 'win32'): uses loop.add_signal_handler, which delivers
+        signals directly to the running event loop.
 
-        # Setup signal handlers based on platform
-        if os.name == "nt":  # Windows
-            # Windows only supports SIGINT and SIGTERM
-            signal.signal(signal.SIGINT, signal_handler)
-            # SIGTERM is not supported on Windows, but SIGBREAK is similar
-            try:
-                signal.signal(signal.SIGBREAK, signal_handler)
-            except AttributeError:
-                # SIGBREAK might not be available on all Windows versions
-                pass
-        else:  # Unix-like (macOS, Linux)
-            signal.signal(signal.SIGINT, signal_handler)
-            signal.signal(signal.SIGTERM, signal_handler)
+        Windows (sys.platform == 'win32'): loop.add_signal_handler is not supported;
+        falls back to signal.signal with a synchronous handler that schedules the
+        async shutdown path via loop.call_soon_threadsafe(asyncio.ensure_future, ...).
+        """
+        loop = asyncio.get_running_loop()
 
-    async def _set_shutdown_event(self):
-        """Set the shutdown event asynchronously."""
+        if sys.platform != "win32":
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(
+                    sig,
+                    lambda s=sig: asyncio.ensure_future(self._handle_signal(s)),
+                )
+            logger.info("Signal handlers registered (Unix): SIGTERM, SIGINT")
+        else:
+            # Windows fallback: loop.add_signal_handler is not implemented on ProactorEventLoop.
+            def _win_handler(signum: int, _frame: object) -> None:
+                loop.call_soon_threadsafe(asyncio.ensure_future, self._handle_signal(signum))
+
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    signal.signal(sig, _win_handler)
+                except (ValueError, OSError):
+                    # SIGTERM is not fully supported on some Windows builds; log and continue.
+                    logger.warning(f"Could not install signal handler for {sig} on Windows")
+            logger.info("Signal handlers registered (Windows): SIGINT, SIGTERM (via signal.signal)")
+
+    async def _handle_signal(self, signum: int) -> None:
+        """Signal-triggered async handler: flip running=False and set the shutdown event.
+
+        Args:
+            signum: The signal number received
+        """
+        logger.info(f"Received signal {signum}; initiating graceful shutdown (drain max 60s)")
+        self.running = False
         self.shutdown_event.set()
 
 
