@@ -194,36 +194,62 @@ class TestFileChangeHandler:
         assert file_change_handler.watch_folder == temp_watch_folder
         assert file_change_handler.file_listener == mock_file_listener
         assert file_change_handler.event_loop == mock_event_loop
-        assert len(file_change_handler.ignore_patterns) > 0
+        # IGNORE-03: no local ignore_patterns — all ignore logic delegated to IGNORE_RULES singleton
+        assert not hasattr(file_change_handler, "ignore_patterns")
 
-    def test_should_ignore_file_patterns(self, file_change_handler):
-        """Test file ignore patterns."""
-        # Test files that should be ignored
-        assert file_change_handler._should_ignore_file(Path(".DS_Store"))
-        assert file_change_handler._should_ignore_file(Path("Thumbs.db"))
-        assert file_change_handler._should_ignore_file(Path(".milo_backup.info"))
-        assert file_change_handler._should_ignore_file(Path("hiberfil.sys"))
-        assert file_change_handler._should_ignore_file(Path(".hidden_file"))
+    def test_on_any_event_uses_run_coroutine_threadsafe(self, file_change_handler, temp_watch_folder):
+        """ASYNC-01: watchdog events are bridged via asyncio.run_coroutine_threadsafe, not call_soon_threadsafe.
 
-        # Test files that should not be ignored
-        assert not file_change_handler._should_ignore_file(Path("normal_file.txt"))
-        assert not file_change_handler._should_ignore_file(Path("document.pdf"))
-        assert not file_change_handler._should_ignore_file(Path("image.jpg"))
-
-    def test_on_any_event_file_created(self, file_change_handler, temp_watch_folder):
-        """Test handling file created events."""
+        Proves the fix for the Python 3.10+ bug where call_soon_threadsafe(create_task, coro)
+        silently dropped the coroutine. After the fix, every event scheduled must use
+        asyncio.run_coroutine_threadsafe, which returns a concurrent.futures.Future.
+        """
         test_file = temp_watch_folder / "new_file.txt"
-        test_file.write_text("New content")
-
+        test_file.write_text("new content")
         event = FileCreatedEvent(str(test_file))
 
-        # Mock _process_changed_file to avoid coroutine creation
-        with patch.object(file_change_handler, "_process_changed_file"):
-            # Should schedule async processing
+        with (
+            patch("aws_copier.core.folder_watcher.asyncio.run_coroutine_threadsafe") as mock_run,
+            patch.object(file_change_handler, "_process_changed_file") as mock_process,
+        ):
+            # mock_process returns a coroutine object when called
+            mock_process.return_value = MagicMock(name="coroutine")
             file_change_handler.on_any_event(event)
 
-            # Verify call_soon_threadsafe was called
-            file_change_handler.event_loop.call_soon_threadsafe.assert_called_once()
+        # Assert: the new API was used exactly once with the handler's event_loop
+        assert mock_run.call_count == 1
+        args, _ = mock_run.call_args
+        assert args[1] is file_change_handler.event_loop
+
+    def test_on_any_event_does_not_use_call_soon_threadsafe(self, file_change_handler, temp_watch_folder):
+        """ASYNC-01 regression guard: the old broken bridge must never be reintroduced."""
+        test_file = temp_watch_folder / "new_file.txt"
+        test_file.write_text("new content")
+        event = FileCreatedEvent(str(test_file))
+
+        with (
+            patch("aws_copier.core.folder_watcher.asyncio.run_coroutine_threadsafe"),
+            patch.object(file_change_handler, "_process_changed_file"),
+        ):
+            file_change_handler.on_any_event(event)
+
+        # The handler's event_loop is a MagicMock in the fixture; assert call_soon_threadsafe was NOT invoked.
+        assert file_change_handler.event_loop.call_soon_threadsafe.call_count == 0
+
+    def test_on_any_event_skips_ignored_file_via_ignore_rules(self, file_change_handler, temp_watch_folder):
+        """IGNORE-03: FileChangeHandler uses IGNORE_RULES.should_ignore_file, not its own local set.
+
+        Creates a .env file (which must be ignored by IGNORE_RULES) and asserts that
+        run_coroutine_threadsafe is NOT called for it.
+        """
+        ignored_file = temp_watch_folder / ".env"
+        ignored_file.write_text("SECRET=x")
+        event = FileCreatedEvent(str(ignored_file))
+
+        with patch("aws_copier.core.folder_watcher.asyncio.run_coroutine_threadsafe") as mock_run:
+            file_change_handler.on_any_event(event)
+
+        assert mock_run.call_count == 0
 
     def test_on_any_event_file_modified(self, file_change_handler, temp_watch_folder):
         """Test handling file modified events."""
@@ -232,12 +258,15 @@ class TestFileChangeHandler:
         event = FileModifiedEvent(str(test_file))
 
         # Mock _process_changed_file to avoid coroutine creation
-        with patch.object(file_change_handler, "_process_changed_file"):
-            # Should schedule async processing
+        with (
+            patch("aws_copier.core.folder_watcher.asyncio.run_coroutine_threadsafe") as mock_run,
+            patch.object(file_change_handler, "_process_changed_file") as mock_process,
+        ):
+            mock_process.return_value = MagicMock(name="coroutine")
             file_change_handler.on_any_event(event)
 
-            # Verify call_soon_threadsafe was called
-            file_change_handler.event_loop.call_soon_threadsafe.assert_called_once()
+            # Verify run_coroutine_threadsafe was called
+            assert mock_run.call_count == 1
 
     def test_on_any_event_directory_created(self, file_change_handler, temp_watch_folder):
         """Test handling directory created events (should be ignored)."""
@@ -246,11 +275,12 @@ class TestFileChangeHandler:
 
         event = DirCreatedEvent(str(test_dir))
 
-        # Should not schedule processing for directories
-        file_change_handler.on_any_event(event)
+        with patch("aws_copier.core.folder_watcher.asyncio.run_coroutine_threadsafe") as mock_run:
+            # Should not schedule processing for directories
+            file_change_handler.on_any_event(event)
 
-        # Verify call_soon_threadsafe was not called
-        file_change_handler.event_loop.call_soon_threadsafe.assert_not_called()
+            # Verify run_coroutine_threadsafe was not called
+            assert mock_run.call_count == 0
 
     def test_on_any_event_ignored_file(self, file_change_handler, temp_watch_folder):
         """Test handling events for ignored files."""
@@ -259,11 +289,12 @@ class TestFileChangeHandler:
 
         event = FileCreatedEvent(str(ignored_file))
 
-        # Should not schedule processing for ignored files
-        file_change_handler.on_any_event(event)
+        with patch("aws_copier.core.folder_watcher.asyncio.run_coroutine_threadsafe") as mock_run:
+            # Should not schedule processing for ignored files
+            file_change_handler.on_any_event(event)
 
-        # Verify call_soon_threadsafe was not called
-        file_change_handler.event_loop.call_soon_threadsafe.assert_not_called()
+            # Verify run_coroutine_threadsafe was not called
+            assert mock_run.call_count == 0
 
     def test_on_any_event_backup_info_file(self, file_change_handler, temp_watch_folder):
         """Test handling events for .milo_backup.info files (should be ignored)."""
@@ -272,11 +303,12 @@ class TestFileChangeHandler:
 
         event = FileModifiedEvent(str(backup_file))
 
-        # Should not schedule processing for backup info files
-        file_change_handler.on_any_event(event)
+        with patch("aws_copier.core.folder_watcher.asyncio.run_coroutine_threadsafe") as mock_run:
+            # Should not schedule processing for backup info files
+            file_change_handler.on_any_event(event)
 
-        # Verify call_soon_threadsafe was not called
-        file_change_handler.event_loop.call_soon_threadsafe.assert_not_called()
+            # Verify run_coroutine_threadsafe was not called
+            assert mock_run.call_count == 0
 
     def test_on_any_event_nonexistent_file(self, file_change_handler, temp_watch_folder):
         """Test handling events for files that don't exist."""
@@ -284,11 +316,12 @@ class TestFileChangeHandler:
 
         event = FileCreatedEvent(str(nonexistent_file))
 
-        # Should not schedule processing for nonexistent files
-        file_change_handler.on_any_event(event)
+        with patch("aws_copier.core.folder_watcher.asyncio.run_coroutine_threadsafe") as mock_run:
+            # Should not schedule processing for nonexistent files
+            file_change_handler.on_any_event(event)
 
-        # Verify call_soon_threadsafe was not called
-        file_change_handler.event_loop.call_soon_threadsafe.assert_not_called()
+            # Verify run_coroutine_threadsafe was not called
+            assert mock_run.call_count == 0
 
     async def test_process_changed_file_in_watch_folder(self, file_change_handler, temp_watch_folder):
         """Test processing a changed file within watch folder."""
@@ -384,14 +417,15 @@ class TestFolderWatcherErrorHandling:
         test_file = temp_watch_folder / "error_file.txt"
         event = FileCreatedEvent(str(test_file))
 
-        # Mock call_soon_threadsafe to raise an exception
-        file_change_handler.event_loop.call_soon_threadsafe.side_effect = Exception("Test error")
+        # Mock run_coroutine_threadsafe to raise an exception
+        with patch("aws_copier.core.folder_watcher.asyncio.run_coroutine_threadsafe") as mock_run:
+            mock_run.side_effect = Exception("Test error")
 
-        # Should not raise an exception
-        try:
-            file_change_handler.on_any_event(event)
-        except Exception as e:
-            pytest.fail(f"FileChangeHandler should handle errors gracefully, but raised: {e}")
+            # Should not raise an exception
+            try:
+                file_change_handler.on_any_event(event)
+            except Exception as e:
+                pytest.fail(f"FileChangeHandler should handle errors gracefully, but raised: {e}")
 
     async def test_process_changed_file_error_handling(
         self, test_config, temp_watch_folder, mock_file_listener, mock_event_loop
