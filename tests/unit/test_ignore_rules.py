@@ -1,7 +1,6 @@
 """Behaviour-proving tests for aws_copier.core.ignore_rules (IGNORE-01, IGNORE-02, IGNORE-03)."""
 
 import os
-import tempfile
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
