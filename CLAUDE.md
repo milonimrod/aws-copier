@@ -217,6 +217,13 @@ Use these entry points:
 - `/gsd-execute-phase` for planned phase work
 
 Do not make direct repo edits outside a GSD workflow unless the user explicitly asks to bypass it.
+
+## GitHub PR Convention
+
+After each phase execution completes (all plans done, verification passed):
+1. Push the current branch to origin: `git push -u origin <branch>`
+2. Open a PR targeting `main` with title `feat(phaseN): <phase-name>` and a summary of what was built
+3. Do this automatically as the final step of `/gsd-execute-phase` — no need to ask
 <!-- GSD:workflow-end -->
 
 

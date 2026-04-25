@@ -38,7 +38,7 @@ line-length = 88
 target-version = ['py39']
 
 [tool.ruff]
-lint.ignore = ["E501","E402","E731","E741","E712"]
+lint.ignore = ["E501","E402","E731","E741","E712","G004"]
 extend-exclude = [
   "__pycache__",
   ".eggs",
