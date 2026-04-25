@@ -201,7 +201,7 @@ class S3Manager:
                         hasher.update(chunk)
                 return hasher.hexdigest()
 
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             return await loop.run_in_executor(None, _hash_file)
 
         except Exception as e:
