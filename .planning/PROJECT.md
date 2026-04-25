@@ -12,6 +12,19 @@ Files in watched folders are reliably, completely synced to S3 — nothing silen
 
 ### Validated
 
+**Validated in Phase 1: core-reliability**
+- ✓ Concurrent uploads via `asyncio.gather` (ASYNC-02) — replaces serial await loop
+- ✓ Real-time watchdog bridge via `asyncio.run_coroutine_threadsafe` (ASYNC-01)
+- ✓ Glob-based ignore rules via `fnmatch` in unified `IgnoreRules` singleton (IGNORE-01/02/03)
+- ✓ `max_concurrent_uploads` wired to semaphore (CONFIG-01)
+- ✓ Async file I/O for backup state via `aiofiles` + per-folder locks (ASYNC-03)
+- ✓ `aws-copier` CLI entrypoint fixed to `main:sync_main` (CONFIG-02)
+- ✓ Dead `discovered_files_folder` field removed from `SimpleConfig` (CONFIG-03)
+- ✓ `ruff`/`python-dotenv` moved to dev dependencies (CONFIG-04)
+- ✓ `ignored_files` stat counter now increments correctly (IGNORE-04)
+- ✓ Signal handling re-enabled with 60-second graceful drain on SIGTERM (ASYNC-06)
+
+**Pre-existing (carried forward)**
 - ✓ Incremental backup scan using per-directory `.milo_backup.info` MD5 tracking — existing
 - ✓ Real-time folder watching via watchdog, routing events into asyncio event loop — existing
 - ✓ Async S3 uploads with multipart support for files >100MB — existing
@@ -24,16 +37,7 @@ Files in watched folders are reliably, completely synced to S3 — nothing silen
 
 ### Active
 
-- [ ] Fix serial upload bug — tasks created concurrently but awaited one-by-one; replace with `asyncio.gather`
-- [ ] Fix real-time watcher thread bridge — `call_soon_threadsafe(asyncio.create_task, coro)` anti-pattern causes wrong-loop errors
-- [ ] Fix glob patterns in ignore list — `*.pyc`, `*.bak` etc. never matched as globs; use `fnmatch`
-- [ ] Fix hidden file leakage — `.env`, `.npmrc` and other dot-files in watch folders are uploaded to S3
-- [ ] Wire `max_concurrent_uploads` config to semaphore — currently hardcoded to 50, config field has no effect
-- [ ] Fix broken `aws-copier` CLI entrypoint in `pyproject.toml` — points to non-existent `simple_main:main`
-- [ ] Fix `ignored_files` stat counter — never incremented, always reports 0
-- [ ] Deduplicate ignore patterns — `FileListener` and `FileChangeHandler` maintain separate diverging sets
-- [ ] Fix sync file I/O in async methods — `_load_backup_info` and `_update_backup_info` use blocking `open()`
-- [ ] Re-enable signal handling in headless mode — `_setup_signal_handlers()` call is commented out, preventing graceful shutdown
+_(Phase 1 cleared all active reliability items — see Validated below)_
 
 ### Out of Scope
 
@@ -82,4 +86,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-24 after initialization*
+*Last updated: 2026-04-25 after Phase 1: core-reliability*
