@@ -16,7 +16,6 @@ def test_simple_config_creation():
     assert config.s3_bucket == "your-bucket-name"
     assert config.max_concurrent_uploads == 100
     assert len(config.watch_folders) == 1
-    assert config.discovered_files_folder is not None
 
 
 def test_simple_config_with_kwargs():
@@ -80,24 +79,6 @@ def test_config_to_dict():
     # With new format, watch_folders is now a dict mapping paths to S3 names
     assert config_dict["watch_folders"] == {"/tmp": "tmp"}
     assert config_dict["aws_region"] == "us-east-1"  # default value
-
-
-def test_config_create_directories():
-    """Test creating directories."""
-    with tempfile.TemporaryDirectory() as temp_dir:
-        discovered_folder = Path(temp_dir) / "test_discovered"
-
-        config = SimpleConfig(discovered_files_folder=str(discovered_folder))
-
-        # Directory should not exist yet
-        assert not discovered_folder.exists()
-
-        # Create directories
-        config.create_directories()
-
-        # Directory should now exist
-        assert discovered_folder.exists()
-        assert discovered_folder.is_dir()
 
 
 def test_yaml_file_not_found():
@@ -247,3 +228,30 @@ def test_invalid_watch_folders_type():
     default_path = Path.home() / "Documents"
     assert config.watch_folders[0] == default_path
     assert config.folder_s3_mapping[default_path] == "Documents"
+
+
+def test_discovered_files_folder_removed():
+    """CONFIG-03: the `discovered_files_folder` field and create_directories method are gone."""
+    config = SimpleConfig()
+    assert not hasattr(config, "discovered_files_folder")
+    assert not hasattr(config, "create_directories")
+    assert "discovered_files_folder" not in config.to_dict()
+
+
+def test_legacy_config_with_discovered_files_folder_ignored(tmp_path):
+    """CONFIG-03: loading an old YAML with discovered_files_folder field still works."""
+    legacy_yaml = tmp_path / "legacy.yaml"
+    legacy_yaml.write_text(
+        "aws_access_key_id: X\n"
+        "aws_secret_access_key: Y\n"
+        "aws_region: us-east-1\n"
+        "s3_bucket: bucket\n"
+        "s3_prefix: ''\n"
+        "watch_folders:\n"
+        "  /tmp: tmp\n"
+        "discovered_files_folder: /some/legacy/path\n"
+        "max_concurrent_uploads: 25\n"
+    )
+    config = SimpleConfig.load_from_yaml(legacy_yaml)
+    assert config.max_concurrent_uploads == 25
+    assert not hasattr(config, "discovered_files_folder")

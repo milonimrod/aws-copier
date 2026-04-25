@@ -8,9 +8,7 @@ dependencies = [
     "aiobotocore>=2.24.1", # Truly async S3 operations
     "watchdog>=3.0.0", # File system monitoring
     "pyyaml>=6.0.2", # YAML configuration
-    "python-dotenv>=1.1.1",
     "aiofiles>=24.1.0",
-    "ruff>=0.12.11",
 ]
 
 [project.optional-dependencies]
@@ -29,7 +27,7 @@ ui = [
 ]
 
 [project.scripts]
-aws-copier = "simple_main:main"
+aws-copier = "main:sync_main"
 
 [build-system]
 requires = ["hatchling"]
@@ -40,7 +38,7 @@ line-length = 88
 target-version = ['py39']
 
 [tool.ruff]
-lint.ignore = ["E501","E402","E731","E741","E712"]
+lint.ignore = ["E501","E402","E731","E741","E712","G004"]
 extend-exclude = [
   "__pycache__",
   ".eggs",
@@ -89,4 +87,6 @@ dev = [
     "pytest>=8.4.1",
     "pytest-asyncio>=1.1.0",
     "pytest-cov>=6.2.1",
+    "python-dotenv>=1.1.1",
+    "ruff>=0.12.11",
 ]

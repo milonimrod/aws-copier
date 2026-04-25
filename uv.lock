@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.9"
 resolution-markers = [
     "python_full_version >= '3.10'",
@@ -195,9 +195,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiobotocore" },
     { name = "aiofiles" },
-    { name = "python-dotenv" },
     { name = "pyyaml" },
-    { name = "ruff" },
     { name = "watchdog" },
 ]
 
@@ -219,6 +217,8 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
+    { name = "python-dotenv" },
+    { name = "ruff" },
 ]
 
 [package.metadata]
@@ -232,9 +232,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.4.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.1.0" },
-    { name = "python-dotenv", specifier = ">=1.1.1" },
     { name = "pyyaml", specifier = ">=6.0.2" },
-    { name = "ruff", specifier = ">=0.12.11" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
     { name = "watchdog", specifier = ">=3.0.0" },
 ]
@@ -246,6 +244,8 @@ dev = [
     { name = "pytest", specifier = ">=8.4.1" },
     { name = "pytest-asyncio", specifier = ">=1.1.0" },
     { name = "pytest-cov", specifier = ">=6.2.1" },
+    { name = "python-dotenv", specifier = ">=1.1.1" },
+    { name = "ruff", specifier = ">=0.12.11" },
 ]
 
 [[package]]

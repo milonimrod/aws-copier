@@ -9,6 +9,7 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from aws_copier.core.file_listener import FileListener
+from aws_copier.core.ignore_rules import IGNORE_RULES
 from aws_copier.models.simple_config import SimpleConfig
 
 
@@ -19,7 +20,11 @@ class FileChangeHandler(FileSystemEventHandler):
     """Handles file system change events."""
 
     def __init__(
-        self, config: SimpleConfig, watch_folder: Path, file_listener: FileListener, event_loop: asyncio.BaseEventLoop
+        self,
+        config: SimpleConfig,
+        watch_folder: Path,
+        file_listener: FileListener,
+        event_loop: asyncio.AbstractEventLoop,
     ):
         """Initialize file change handler.
 
@@ -34,47 +39,6 @@ class FileChangeHandler(FileSystemEventHandler):
         self.watch_folder = watch_folder
         self.file_listener = file_listener
         self.event_loop = event_loop
-        # File extensions and patterns to ignore (same as FileListener)
-        self.ignore_patterns = {
-            # System files (cross-platform)
-            ".DS_Store",
-            "Thumbs.db",
-            "desktop.ini",
-            # Windows system files
-            "hiberfil.sys",
-            "pagefile.sys",
-            "swapfile.sys",
-            "$RECYCLE.BIN",
-            "System Volume Information",
-            # Temporary files
-            ".tmp",
-            ".temp",
-            ".swp",
-            ".swo",
-            # Version control
-            ".git",
-            ".gitignore",
-            ".svn",
-            # IDE files
-            ".vscode",
-            ".idea",
-            "*.pyc",
-            "__pycache__",
-            # OS specific (macOS)
-            ".Trashes",
-            ".Spotlight-V100",
-            ".fseventsd",
-            # Common build/cache directories
-            "node_modules",
-            ".pytest_cache",
-            ".coverage",
-            # Backup files
-            "*.bak",
-            "*.backup",
-            "*~",
-            # Our backup info file (IMPORTANT: ignore these!)
-            ".milo_backup.info",
-        }
 
     def on_any_event(self, event: FileSystemEvent) -> None:
         """Handle any file system event."""
@@ -89,17 +53,20 @@ class FileChangeHandler(FileSystemEventHandler):
 
             file_path = Path(event.src_path)
 
-            # Skip if file should be ignored
-            if self._should_ignore_file(file_path):
+            # Skip if file should be ignored (IGNORE-03: delegate to canonical IGNORE_RULES singleton)
+            if IGNORE_RULES.should_ignore_file(file_path):
                 return
 
             # Skip if file doesn't exist (might have been deleted quickly)
             if not file_path.exists():
                 return
 
-            # Schedule async processing using thread-safe method
-            self.event_loop.call_soon_threadsafe(
-                asyncio.create_task, self._process_changed_file(file_path, event.event_type)
+            # Schedule async processing via run_coroutine_threadsafe (ASYNC-01).
+            # Returns a concurrent.futures.Future; do NOT call .result() here — that would
+            # deadlock the watchdog thread waiting on the main asyncio loop.
+            asyncio.run_coroutine_threadsafe(
+                self._process_changed_file(file_path, event.event_type),
+                self.event_loop,
             )
 
         except Exception as e:
@@ -138,28 +105,6 @@ class FileChangeHandler(FileSystemEventHandler):
 
         except Exception as e:
             logger.error(f"Error processing changed file {file_path}: {e}")
-
-    def _should_ignore_file(self, file_path: Path) -> bool:
-        """Check if a file should be ignored.
-
-        Args:
-            file_path: Path to file to check
-
-        Returns:
-            True if file should be ignored, False otherwise
-        """
-        filename = file_path.name
-
-        # Check if filename starts with dot (hidden file)
-        if filename.startswith("."):
-            return True
-
-        # Check ignore patterns
-        for pattern in self.ignore_patterns:
-            if (pattern.startswith(".") and filename.endswith(pattern)) or pattern == filename:
-                return True
-
-        return False
 
 
 class FolderWatcher:

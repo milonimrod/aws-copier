@@ -6,10 +6,11 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 import aiofiles
 
+from aws_copier.core.ignore_rules import IGNORE_RULES
 from aws_copier.core.s3_manager import S3Manager
 from aws_copier.models.simple_config import SimpleConfig
 
@@ -30,67 +31,22 @@ class FileListener:
         self.s3_manager = s3_manager
         self.backup_info_filename = ".milo_backup.info"
 
-        # Semaphore to limit concurrent uploads
-        self.upload_semaphore = asyncio.Semaphore(50)
+        # CONFIG-01: Semaphore wired to user-configured max_concurrent_uploads (default 100).
+        self.upload_semaphore = asyncio.Semaphore(self.config.max_concurrent_uploads)
 
-        # Separate semaphore for MD5 computation to avoid blocking uploads
+        # Separate semaphore for MD5 computation to avoid blocking uploads.
         self.md5_semaphore = asyncio.Semaphore(50)
 
-        # File extensions and patterns to ignore
-        self.ignore_patterns = {
-            # System files (cross-platform)
-            ".DS_Store",
-            "Thumbs.db",
-            "desktop.ini",
-            # Windows system files
-            "hiberfil.sys",
-            "pagefile.sys",
-            "swapfile.sys",
-            # Temporary files
-            ".tmp",
-            ".temp",
-            ".swp",
-            ".swo",
-            # Version control
-            ".git",
-            ".gitignore",
-            ".svn",
-            # IDE files
-            ".vscode",
-            ".idea",
-            "*.pyc",
-            "__pycache__",
-            # OS specific (macOS)
-            ".Trashes",
-            ".Spotlight-V100",
-            ".fseventsd",
-            # Common build/cache directories
-            "node_modules",
-            ".pytest_cache",
-            ".coverage",
-            # Backup files
-            "*.bak",
-            "*.backup",
-            "*~",
-            # Our backup info file
-            ".milo_backup.info",
-        }
+        # ASYNC-03: per-folder asyncio.Lock registry. Protects read-modify-write on
+        # .milo_backup.info against concurrent scan + real-time event hitting the same folder.
+        self._folder_locks: Dict[Path, asyncio.Lock] = {}
 
-        # Directories to ignore completely
-        self.ignore_dirs = {
-            ".git",
-            ".svn",
-            ".hg",
-            "__pycache__",
-            ".pytest_cache",
-            "node_modules",
-            ".venv",
-            "venv",
-            ".aws-copier",  # Our own config folder
-            # Windows system directories
-            "$RECYCLE.BIN",
-            "System Volume Information",
-        }
+        # ASYNC-06 hook: active upload tasks tracked here so the shutdown drain can wait on them.
+        # Tasks add themselves in _upload_files; done-callback discards them.
+        self._active_upload_tasks: Set[asyncio.Task] = set()
+
+        # ASYNC-04: do not call asyncio.get_event_loop() inside this class — use
+        # asyncio.get_running_loop() or asyncio.to_thread() when a loop reference is needed.
 
         # Statistics
         self._stats = {
@@ -101,6 +57,19 @@ class FileListener:
             "skipped_files": 0,
             "errors": 0,
         }
+
+    def _get_folder_lock(self, folder_path: Path) -> asyncio.Lock:
+        """Return (creating if needed) the asyncio.Lock guarding backup-info I/O for a folder.
+
+        Args:
+            folder_path: Directory whose .milo_backup.info file needs serialised access
+
+        Returns:
+            asyncio.Lock unique to this folder path (same instance across repeat calls)
+        """
+        if folder_path not in self._folder_locks:
+            self._folder_locks[folder_path] = asyncio.Lock()
+        return self._folder_locks[folder_path]
 
     async def scan_all_folders(self) -> None:
         """Scan all configured watch folders using incremental backup approach."""
@@ -127,8 +96,8 @@ class FileListener:
             folder_path: Path to folder to process
         """
         try:
-            # Skip ignored directories
-            if self._should_ignore_directory(folder_path):
+            # Skip ignored directories (IGNORE-03: delegate to IGNORE_RULES)
+            if IGNORE_RULES.should_ignore_dir(folder_path):
                 return
 
             logger.info(f"Processing folder: {folder_path}")
@@ -140,7 +109,7 @@ class FileListener:
             # Step 2: Process all subfolders recursively
             try:
                 for item in folder_path.iterdir():
-                    if item.is_dir() and not self._should_ignore_directory(item):
+                    if item.is_dir() and not IGNORE_RULES.should_ignore_dir(item):
                         await self._process_folder_recursively(item)
             except PermissionError:
                 logger.warning(f"Permission denied accessing folder: {folder_path}")
@@ -200,7 +169,10 @@ class FileListener:
                 logger.info(f"Updated backup info for {folder_path} with unchanged files")
 
     async def _load_backup_info(self, backup_info_file: Path) -> Dict[str, str]:
-        """Load existing backup info from .milo_backup.info file.
+        """Load existing backup info from .milo_backup.info file using aiofiles under a per-folder lock.
+
+        ASYNC-03: async I/O via aiofiles; asyncio.Lock prevents interleaved reads during concurrent
+        scan + real-time event processing of the same folder.
 
         Args:
             backup_info_file: Path to backup info file
@@ -212,9 +184,11 @@ class FileListener:
             return {}
 
         try:
-            with open(backup_info_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data.get("files", {})
+            async with self._get_folder_lock(backup_info_file.parent):
+                async with aiofiles.open(backup_info_file, "r", encoding="utf-8") as f:
+                    content = await f.read()
+            data = json.loads(content)
+            return data.get("files", {})
         except Exception as e:
             logger.warning(f"Failed to load backup info from {backup_info_file}: {e}")
             return {}
@@ -234,8 +208,11 @@ class FileListener:
             # Collect all files to process
             files_to_scan = []
             for file_path in folder_path.iterdir():
-                # Skip directories and ignored files
-                if file_path.is_dir() or self._should_ignore_file(file_path):
+                if file_path.is_dir():
+                    continue
+                # IGNORE-03: delegate to IGNORE_RULES; IGNORE-04: count ignored files in stats
+                if IGNORE_RULES.should_ignore_file(file_path):
+                    self._stats["ignored_files"] += 1
                     continue
                 files_to_scan.append(file_path)
 
@@ -339,12 +316,43 @@ class FileListener:
                 self._stats["errors"] += 1
                 return False
 
+    async def _upload_with_timeout(self, filename: str, folder_path: Path) -> Tuple[str, bool]:
+        """Wrap a single upload in asyncio.wait_for so the 300s window belongs to the coroutine, not the task.
+
+        ASYNC-02 Pitfall 1 fix: when wait_for was applied to an already-created task
+        inside a serial for-loop, the N-th file's timeout window began only after the
+        (N-1)-th completed or timed out. Wrapping the coroutine BEFORE create_task ensures
+        each file gets its own independent 300s window running concurrently.
+
+        Args:
+            filename: Name of file to upload
+            folder_path: Folder containing the file
+
+        Returns:
+            Tuple (filename, success_bool). Exceptions are caught and surfaced as (filename, False).
+        """
+        try:
+            result = await asyncio.wait_for(self._upload_single_file(filename, folder_path), timeout=300)
+            return filename, bool(result)
+        except asyncio.TimeoutError:
+            logger.error(f"Upload timeout for {filename} (5 minutes)")
+            self._stats["errors"] += 1
+            return filename, False
+        except Exception as e:
+            logger.error(f"Upload task failed for {filename}: {e}")
+            self._stats["errors"] += 1
+            return filename, False
+
     async def _upload_files(self, files_to_upload: List[str], folder_path: Path) -> List[str]:
-        """Upload files to S3 concurrently after checking remote MD5.
+        """Upload files to S3 concurrently using asyncio.gather.
+
+        ASYNC-02 fix: replaces serial-wait_for-in-for-loop with a single gather call so all
+        N uploads race their 300s timeouts concurrently. ASYNC-06 hook: each task is also
+        added to self._active_upload_tasks so the shutdown drain can await in-flight work.
 
         Args:
             files_to_upload: List of filenames to upload
-            folder_path: Path to folder containing the files
+            folder_path: Folder containing the files
 
         Returns:
             List of filenames that were successfully uploaded
@@ -352,40 +360,39 @@ class FileListener:
         if not files_to_upload:
             return []
 
-        # Create tasks for all files with timeout to prevent hanging
-        upload_tasks = []
-        for filename in files_to_upload:
-            task = asyncio.create_task(self._upload_single_file(filename, folder_path))
-            upload_tasks.append((filename, task))
-
-        # Run all uploads concurrently with timeout
-        logger.info(f"Starting concurrent upload of {len(files_to_upload)} files (max 50 parallel)")
-
-        uploaded_files = []
-        for filename, task in upload_tasks:
-            try:
-                # Add timeout to prevent hanging on individual files
-                result = await asyncio.wait_for(task, timeout=300)  # 5 minute timeout per file
-
-                if result:
-                    uploaded_files.append(filename)
-                    logger.debug(f"Successfully uploaded: {filename}")
-                else:
-                    logger.warning(f"Upload failed for: {filename}")
-                    self._stats["errors"] += 1
-
-            except asyncio.TimeoutError:
-                logger.error(f"Upload timeout for {filename} (5 minutes)")
-                self._stats["errors"] += 1
-                task.cancel()  # Cancel the hanging task
-
-            except Exception as e:
-                logger.error(f"Upload task failed for {filename}: {e}")
-                self._stats["errors"] += 1
-
         logger.info(
-            f"Completed concurrent upload: {len(uploaded_files)} files uploaded successfully out of {len(files_to_upload)} total"
+            f"Starting concurrent upload of {len(files_to_upload)} files "
+            f"(max {self.config.max_concurrent_uploads} parallel)"
         )
+
+        tasks: List[asyncio.Task] = []
+        for filename in files_to_upload:
+            task = asyncio.create_task(
+                self._upload_with_timeout(filename, folder_path),
+                name=f"upload-{folder_path.name}-{filename}",
+            )
+            self._active_upload_tasks.add(task)
+            task.add_done_callback(self._active_upload_tasks.discard)
+            tasks.append(task)
+
+        # Gather all upload coroutines concurrently; return_exceptions=True prevents one
+        # failure from cancelling the rest.
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        uploaded_files: List[str] = []
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"Upload coroutine raised unexpectedly: {result}")
+                self._stats["errors"] += 1
+                continue
+            filename, ok = result
+            if ok:
+                uploaded_files.append(filename)
+                logger.debug(f"Successfully uploaded: {filename}")
+            else:
+                logger.warning(f"Upload failed for: {filename}")
+
+        logger.info(f"Completed concurrent upload: {len(uploaded_files)} / {len(files_to_upload)} files uploaded")
         return uploaded_files
 
     def _build_s3_key(self, file_path: Path) -> str:
@@ -413,18 +420,20 @@ class FileListener:
         return str(file_path).replace("\\", "/")
 
     async def _update_backup_info(self, backup_info_file: Path, backup_files: Dict[str, str]) -> None:
-        """Update the .milo_backup.info file with successfully backed up file states.
+        """Update the .milo_backup.info file using aiofiles under the per-folder lock.
+
+        ASYNC-03: async write via aiofiles; asyncio.Lock prevents a simultaneous read
+        from seeing a half-written file.
 
         Args:
             backup_info_file: Path to backup info file
             backup_files: Files and their MD5 hashes to record as backed up
         """
         backup_info = {"timestamp": datetime.now().isoformat(), "files": backup_files}
-
         try:
-            with open(backup_info_file, "w", encoding="utf-8") as f:
-                json.dump(backup_info, f, indent=2)
-
+            async with self._get_folder_lock(backup_info_file.parent):
+                async with aiofiles.open(backup_info_file, "w", encoding="utf-8") as f:
+                    await f.write(json.dumps(backup_info, indent=2))
         except Exception as e:
             logger.error(f"Failed to update backup info {backup_info_file}: {e}")
 
@@ -462,57 +471,6 @@ class FileListener:
         except Exception as e:
             logger.error(f"Error calculating MD5 for {file_path}: {e}")
             return None
-
-    def _should_ignore_file(self, file_path: Path) -> bool:
-        """Check if a file should be ignored.
-
-        Args:
-            file_path: Path to file to check
-
-        Returns:
-            True if file should be ignored, False otherwise
-        """
-        filename = file_path.name
-
-        # Check exact filename matches
-        if filename in self.ignore_patterns:
-            return True
-
-        # Check if filename starts with patterns from ignore_patterns
-        for pattern in self.ignore_patterns:
-            if pattern.startswith(".") and filename.startswith(pattern):
-                return True
-
-        return False
-
-    def _should_ignore_directory(self, dir_path: Path) -> bool:
-        """Check if a directory should be ignored.
-
-        Args:
-            dir_path: Path to directory to check
-
-        Returns:
-            True if directory should be ignored, False otherwise
-        """
-        dirname = dir_path.name
-
-        # Check if directory is in ignore list
-        if dirname in self.ignore_dirs:
-            return True
-
-        # Check if directory starts with . (hidden directories)
-        if dirname.startswith("."):
-            return True
-
-        try:
-            if dir_path.is_symlink():
-                return True
-            if hasattr(dir_path, "is_dir") and hasattr(dir_path, "exists"):
-                if dir_path.exists() and not dir_path.is_dir():
-                    return True
-        except Exception:
-            return False
-        return False
 
     def get_statistics(self) -> dict:
         """Get current statistics.

@@ -38,12 +38,6 @@ class SimpleConfig:
             self.watch_folders: List[Path] = [default_path]
             self.folder_s3_mapping: Dict[Path, str] = {default_path: "Documents"}
 
-        # File discovery output
-        discovered_files_folder_data = kwargs.get(
-            "discovered_files_folder", str(Path.home() / ".aws-copier" / "discovered")
-        )
-        self.discovered_files_folder: Path = Path(discovered_files_folder_data)
-
         # Upload settings
         self.max_concurrent_uploads: int = kwargs.get("max_concurrent_uploads", 100)
 
@@ -67,7 +61,6 @@ class SimpleConfig:
             "s3_bucket": self.s3_bucket,
             "s3_prefix": self.s3_prefix,
             "watch_folders": {str(folder_path): s3_name for folder_path, s3_name in self.folder_s3_mapping.items()},
-            "discovered_files_folder": str(self.discovered_files_folder),
             "max_concurrent_uploads": self.max_concurrent_uploads,
         }
 
@@ -75,10 +68,6 @@ class SimpleConfig:
 
         with open(config_path, "w") as f:
             yaml.dump(data, f, default_flow_style=False, indent=2)
-
-    def create_directories(self) -> None:
-        """Create necessary directories."""
-        self.discovered_files_folder.mkdir(parents=True, exist_ok=True)
 
     def get_s3_name_for_folder(self, folder_path: Path) -> str:
         """Get the S3 name for a given folder path.
@@ -100,7 +89,6 @@ class SimpleConfig:
             "s3_bucket": self.s3_bucket,
             "s3_prefix": self.s3_prefix,
             "watch_folders": {str(folder_path): s3_name for folder_path, s3_name in self.folder_s3_mapping.items()},
-            "discovered_files_folder": str(self.discovered_files_folder),
             "max_concurrent_uploads": self.max_concurrent_uploads,
         }
 

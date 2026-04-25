@@ -3,6 +3,7 @@ Comprehensive tests for FileListener with proper S3Manager mocking.
 Tests the incremental backup functionality without testing S3 operations.
 """
 
+import asyncio
 import json
 import tempfile
 from pathlib import Path
@@ -243,9 +244,9 @@ class TestFileListenerUploads:
 
         uploaded_files = await file_listener._upload_files(files_to_upload, temp_watch_folder)
 
-        # Fixed: Now correctly returns list of successfully uploaded filenames
+        # Concurrent gather returns all successfully uploaded filenames
         assert len(uploaded_files) == 2
-        assert uploaded_files == ["file1.txt", "file2.txt"]  # Correct behavior: filenames returned
+        assert set(uploaded_files) == {"file1.txt", "file2.txt"}
 
         # Verify S3Manager was called
         assert file_listener.s3_manager.upload_file.call_count == 2
@@ -259,7 +260,6 @@ class TestFileListenerUploads:
 
         uploaded_files = await file_listener._upload_files(files_to_upload, temp_watch_folder)
 
-        # Fixed: Now correctly returns filename when file is skipped (still considered "uploaded")
         # When check_exists returns True, _upload_single_file returns True, so filename is included
         assert len(uploaded_files) == 1
         assert uploaded_files[0] == "file1.txt"  # Correct behavior: filename returned
@@ -384,32 +384,6 @@ class TestFileListenerUtilities:
         md5_hash = await file_listener._calculate_md5(file_path)
 
         assert md5_hash is None
-
-    async def test_should_ignore_file(self, file_listener):
-        """Test file ignore patterns."""
-        # Test files that should be ignored
-        assert file_listener._should_ignore_file(Path(".DS_Store"))
-        assert file_listener._should_ignore_file(Path("Thumbs.db"))
-        assert file_listener._should_ignore_file(Path(".milo_backup.info"))
-
-        # Test files that should not be ignored
-        assert not file_listener._should_ignore_file(Path("normal_file.txt"))
-        assert not file_listener._should_ignore_file(Path("document.pdf"))
-
-    async def test_should_ignore_directory(self, file_listener):
-        """Test directory ignore patterns."""
-        # Test directories that should be ignored
-        assert file_listener._should_ignore_directory(Path(".git"))
-        assert file_listener._should_ignore_directory(Path("__pycache__"))
-        assert file_listener._should_ignore_directory(Path("node_modules"))
-
-        # Test Windows system directories
-        assert file_listener._should_ignore_directory(Path("$RECYCLE.BIN"))
-        assert file_listener._should_ignore_directory(Path("System Volume Information"))
-
-        # Test directories that should not be ignored
-        assert not file_listener._should_ignore_directory(Path("normal_folder"))
-        assert not file_listener._should_ignore_directory(Path("Documents"))
 
 
 class TestFileListenerBackupInfo:
@@ -561,3 +535,145 @@ class TestFileListenerS3KeyBuilding:
         root_file = Path("/Users/test/Documents/readme.txt")
         s3_key = file_listener._build_s3_key(root_file)
         assert s3_key == "MyDocs/readme.txt"
+
+
+class TestFileListenerConfig:
+    """CONFIG-01: upload_semaphore respects config.max_concurrent_uploads."""
+
+    async def test_config_max_concurrent_uploads_wires_to_semaphore(self, tmp_path):
+        """Verify upload_semaphore._value equals the configured max_concurrent_uploads."""
+        config = SimpleConfig(
+            aws_access_key_id="x",
+            aws_secret_access_key="y",
+            aws_region="us-east-1",
+            s3_bucket="b",
+            s3_prefix="",
+            watch_folders=[str(tmp_path)],
+            max_concurrent_uploads=7,
+        )
+        fl = FileListener(config, AsyncMock())
+        assert fl.upload_semaphore._value == 7
+
+
+class TestFileListenerAsyncBackupIO:
+    """ASYNC-03: backup info I/O uses aiofiles under a per-folder asyncio.Lock."""
+
+    async def test_load_backup_info_uses_aiofiles_and_lock(self, file_listener, tmp_path):
+        """Confirm _load_backup_info calls aiofiles.open and returns correct data."""
+        from unittest.mock import patch
+
+        backup_file = tmp_path / ".milo_backup.info"
+        backup_file.write_text('{"timestamp": "2026-01-01T00:00:00", "files": {"a.txt": "hash1"}}')
+        with patch("aws_copier.core.file_listener.aiofiles.open", wraps=__import__("aiofiles").open) as mock_open:
+            result = await file_listener._load_backup_info(backup_file)
+        assert result == {"a.txt": "hash1"}
+        assert mock_open.call_count == 1
+
+    async def test_update_backup_info_uses_aiofiles_and_lock(self, file_listener, tmp_path):
+        """Confirm _update_backup_info calls aiofiles.open and writes correct data."""
+        from unittest.mock import patch
+
+        backup_file = tmp_path / ".milo_backup.info"
+        with patch("aws_copier.core.file_listener.aiofiles.open", wraps=__import__("aiofiles").open) as mock_open:
+            await file_listener._update_backup_info(backup_file, {"a.txt": "hash1"})
+        assert backup_file.exists()
+        assert mock_open.call_count == 1
+        import json
+
+        data = json.loads(backup_file.read_text())
+        assert data["files"] == {"a.txt": "hash1"}
+
+    async def test_folder_lock_is_same_instance_per_folder(self, file_listener, tmp_path):
+        """_get_folder_lock returns the same Lock instance for the same folder path."""
+        lock_a = file_listener._get_folder_lock(tmp_path)
+        lock_b = file_listener._get_folder_lock(tmp_path)
+        assert lock_a is lock_b
+        other_dir = tmp_path / "other"
+        other_dir.mkdir()
+        lock_c = file_listener._get_folder_lock(other_dir)
+        assert lock_a is not lock_c
+
+
+class TestFileListenerConcurrentUpload:
+    """ASYNC-02: _upload_files runs uploads concurrently via asyncio.gather, not serially."""
+
+    async def test_upload_files_runs_concurrently(self, file_listener, temp_watch_folder):
+        """10 files with 0.2s artificial delay each must finish in well under 2s (serial) — around 0.3s."""
+        import time
+
+        async def slow_upload(file_path, s3_key):
+            await asyncio.sleep(0.2)
+            return True
+
+        file_listener.s3_manager.check_exists = AsyncMock(return_value=False)
+        file_listener.s3_manager.upload_file = AsyncMock(side_effect=slow_upload)
+
+        files = [f"f{i}.txt" for i in range(10)]
+        for name in files:
+            (temp_watch_folder / name).write_text("x")
+
+        start = time.monotonic()
+        uploaded = await file_listener._upload_files(files, temp_watch_folder)
+        elapsed = time.monotonic() - start
+
+        assert len(uploaded) == 10
+        # Serial would be >= 2.0s. Concurrent with semaphore >=10 must be under 1.0s.
+        assert elapsed < 1.0, f"Uploads ran serially (elapsed={elapsed:.2f}s)"
+
+    async def test_upload_files_active_tasks_tracked(self, file_listener, temp_watch_folder):
+        """_active_upload_tasks is populated during gather and emptied by done_callback after."""
+        file_listener.s3_manager.check_exists = AsyncMock(return_value=False)
+        file_listener.s3_manager.upload_file = AsyncMock(return_value=True)
+
+        files = [f"t{i}.txt" for i in range(3)]
+        for name in files:
+            (temp_watch_folder / name).write_text("x")
+
+        assert len(file_listener._active_upload_tasks) == 0
+        await file_listener._upload_files(files, temp_watch_folder)
+        # After gather completes, the done_callback has discarded every task.
+        assert len(file_listener._active_upload_tasks) == 0
+
+    async def test_upload_files_gather_handles_exceptions(self, file_listener, temp_watch_folder):
+        """One raising coroutine must not cancel the rest; return_exceptions=True preserves partial success."""
+        calls = {"n": 0}
+
+        async def maybe_fail(file_path, s3_key):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("simulated failure")
+            return True
+
+        file_listener.s3_manager.check_exists = AsyncMock(return_value=False)
+        file_listener.s3_manager.upload_file = AsyncMock(side_effect=maybe_fail)
+
+        files = ["a.txt", "b.txt", "c.txt"]
+        for name in files:
+            (temp_watch_folder / name).write_text("x")
+
+        uploaded = await file_listener._upload_files(files, temp_watch_folder)
+        # Exactly one failed; two succeeded.
+        assert len(uploaded) == 2
+
+
+class TestFileListenerIgnoreIntegration:
+    """IGNORE-03: FileListener delegates to IGNORE_RULES. IGNORE-04: ignored files increment stats."""
+
+    async def test_file_listener_has_no_local_ignore_attrs(self, file_listener):
+        """IGNORE-03: old per-instance ignore sets and methods must be absent."""
+        assert not hasattr(file_listener, "ignore_patterns")
+        assert not hasattr(file_listener, "ignore_dirs")
+        assert not hasattr(file_listener, "_should_ignore_file")
+        assert not hasattr(file_listener, "_should_ignore_directory")
+
+    async def test_scan_increments_ignored_files_stat(self, file_listener, temp_watch_folder):
+        """IGNORE-04: _stats['ignored_files'] increments for each file blocked by IGNORE_RULES."""
+        # Drop a sensitive file that IGNORE_RULES will block (.env starts with dot)
+        (temp_watch_folder / ".env").write_text("SECRET=x")
+        (temp_watch_folder / "regular.txt").write_text("ok")
+
+        before = file_listener._stats["ignored_files"]
+        await file_listener._scan_current_files(temp_watch_folder)
+        after = file_listener._stats["ignored_files"]
+
+        assert after - before >= 1  # at least the .env file
