@@ -4,13 +4,14 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import aiofiles
 from pathspec import PathSpec
+from tqdm import tqdm as sync_tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 from aws_copier.core.ignore_rules import IGNORE_RULES
 from aws_copier.core.s3_manager import S3Manager
@@ -155,17 +156,18 @@ class FileListener:
         """Scan all configured watch folders using incremental backup approach."""
         logger.info("Starting incremental backup scan of all watch folders")
 
-        for folder_path in self.config.watch_folders:
-            if not folder_path.exists():
-                logger.warning(f"Watch folder does not exist: {folder_path}")
-                continue
+        with logging_redirect_tqdm():
+            for folder_path in self.config.watch_folders:
+                if not folder_path.exists():
+                    logger.warning(f"Watch folder does not exist: {folder_path}")
+                    continue
 
-            if not folder_path.is_dir():
-                logger.warning(f"Watch path is not a directory: {folder_path}")
-                continue
+                if not folder_path.is_dir():
+                    logger.warning(f"Watch path is not a directory: {folder_path}")
+                    continue
 
-            logger.info(f"Processing folder: {folder_path}")
-            await self._process_folder_recursively(folder_path)
+                logger.info(f"Processing folder: {folder_path}")
+                await self._process_folder_recursively(folder_path)
 
         logger.info(f"Incremental backup completed. Stats: {self._stats}")
 
@@ -240,9 +242,7 @@ class FileListener:
             # Also include unchanged files that weren't uploaded (they're still valid)
             for filename, entry in current_files.items():
                 if filename not in files_to_upload:  # File wasn't changed, keep existing info
-                    updated_backup_info[filename] = (
-                        entry if isinstance(entry, dict) else {"md5": entry, "mtime": 0.0}
-                    )
+                    updated_backup_info[filename] = entry if isinstance(entry, dict) else {"md5": entry, "mtime": 0.0}
 
             await self._update_backup_info(backup_info_file, updated_backup_info)
             logger.info(
@@ -290,9 +290,7 @@ class FileListener:
                 logger.warning(f"Failed to load backup info from {backup_info_file}: {e}")
                 return {}
             # PERF-01 / D-01: migrate entries
-            data: Dict[str, Dict[str, Any]] = {
-                name: self._migrate_entry(v) for name, v in raw.items()
-            }
+            data: Dict[str, Dict[str, Any]] = {name: self._migrate_entry(v) for name, v in raw.items()}
             self._backup_info_cache[folder] = data
             self._backup_info_mtime[folder] = disk_mtime
             return data
@@ -377,8 +375,12 @@ class FileListener:
 
             logger.debug(f"Computing MD5 for {len(files_to_hash)} files in parallel (max 50 concurrent)")
 
-            # Gather all MD5 tasks concurrently and validate the responses
+            # Gather all MD5 tasks concurrently; done callbacks tick the progress bar.
+            pbar = sync_tqdm(total=len(md5_tasks), desc=f"Hashing  {folder_path.name}", unit="file", leave=False)
+            for _, task in md5_tasks:
+                task.add_done_callback(lambda _f: pbar.update())
             results = await asyncio.gather(*(task for _, task in md5_tasks), return_exceptions=True)
+            pbar.close()
             for (file_path, _), result in zip(md5_tasks, results):
                 if isinstance(result, Exception):
                     logger.error(f"Error computing MD5 for {file_path.name}: {result}")
@@ -421,8 +423,10 @@ class FileListener:
             # Support both bare MD5 strings (pre-Task-2) and new {md5, mtime} dicts
             current_md5 = current_entry if isinstance(current_entry, str) else current_entry.get("md5")
             existing_entry = existing_backup_info.get(filename)
-            existing_md5 = existing_entry if isinstance(existing_entry, str) else (
-                existing_entry.get("md5") if isinstance(existing_entry, dict) else None
+            existing_md5 = (
+                existing_entry
+                if isinstance(existing_entry, str)
+                else (existing_entry.get("md5") if isinstance(existing_entry, dict) else None)
             )
 
             if existing_md5 != current_md5:
@@ -480,7 +484,7 @@ class FileListener:
                     upload_mtime = 0.0
 
                 # Upload file
-                if await self.s3_manager.upload_file(file_path, s3_key):
+                if await self.s3_manager.upload_file(file_path, s3_key, precomputed_md5=local_md5):
                     self._stats["uploaded_files"] += 1
                     logger.info(f"Uploaded: {file_path} -> {s3_key}")
                     return True, upload_mtime
@@ -511,9 +515,7 @@ class FileListener:
             captured just before upload (D-02). On failure, upload_mtime is 0.0.
         """
         try:
-            ok, upload_mtime = await asyncio.wait_for(
-                self._upload_single_file(filename, folder_path), timeout=300
-            )
+            ok, upload_mtime = await asyncio.wait_for(self._upload_single_file(filename, folder_path), timeout=300)
             return filename, bool(ok), upload_mtime
         except asyncio.TimeoutError:
             logger.error(f"Upload timeout for {filename} (5 minutes)")
@@ -558,8 +560,12 @@ class FileListener:
             tasks.append(task)
 
         # Gather all upload coroutines concurrently; return_exceptions=True prevents one
-        # failure from cancelling the rest.
+        # failure from cancelling the rest. Done callbacks tick the progress bar.
+        pbar = sync_tqdm(total=len(tasks), desc=f"Uploading {folder_path.name}", unit="file", leave=True)
+        for task in tasks:
+            task.add_done_callback(lambda _f: pbar.update())
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        pbar.close()
 
         uploaded_files: Dict[str, float] = {}
         for result in results:

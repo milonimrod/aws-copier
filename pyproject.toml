@@ -11,6 +11,7 @@ dependencies = [
     "aiofiles>=24.1.0",
     "pathspec>=0.9.0", # gitignore-style pattern matching for .backupignore (CONFIG-06)
     "aiohttp>=3.9.0",  # Async web server for live log dashboard
+    "tqdm>=4.62.0",   # Progress bars for MD5 hashing and uploads
 ]
 
 [project.optional-dependencies]
