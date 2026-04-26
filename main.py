@@ -54,6 +54,7 @@ class AWSCopierApp:
             WebDashboard(self.file_listener, port=self.config.web_port) if self.config.web_enabled else None
         )
         self.running = False
+        self._shutdown_called = False  # re-entrancy guard, separate from self.running
         self.shutdown_event = asyncio.Event()
 
     async def start(self):
@@ -61,23 +62,23 @@ class AWSCopierApp:
         logger.info("Starting AWS Copier (Simplified Architecture)...")
 
         try:
+            # Register signal handlers first so Ctrl+C / SIGTERM work during init.
+            self._setup_signal_handlers()
+
             # Start web dashboard early so log capture begins immediately.
             if self.web_dashboard is not None:
                 await self.web_dashboard.start()
 
-            # Initialize S3 manager
-            await self.s3_manager.initialize()
+            # Initialize S3 manager — 30 s timeout guards against credential/network hangs.
+            await asyncio.wait_for(self.s3_manager.initialize(), timeout=30)
             logger.info("✅ S3 Manager initialized")
 
             # CONFIG-07: ensure AbortIncompleteMultipartUpload lifecycle rule exists.
             # D-11: never raises; logs warning on failure and continues.
-            await self.s3_manager.ensure_lifecycle_rule()
+            await asyncio.wait_for(self.s3_manager.ensure_lifecycle_rule(), timeout=30)
 
             # D-10: log credential source for audit trail (set by SimpleConfig per CONFIG-05).
             logger.info(f"AWS credentials loaded from: {self.config.credential_source}")
-
-            # ASYNC-06: install SIGTERM / SIGINT handlers now that the loop is running.
-            self._setup_signal_handlers()
 
             # Run incremental backup scan of all folders
             await self.file_listener.scan_all_folders()
@@ -114,10 +115,11 @@ class AWSCopierApp:
 
     async def shutdown(self) -> None:
         """Shutdown the application (ASYNC-06): stop the watcher, drain in-flight uploads, close S3."""
-        if not self.running:
-            # shutdown may be called from the signal handler AND from the main-loop finally;
-            # short-circuit the second call.
+        if self._shutdown_called:
+            # shutdown may be triggered by the signal handler AND by the main-loop finally clause;
+            # the dedicated flag (not self.running) prevents double-cleanup even during init.
             return
+        self._shutdown_called = True
 
         logger.info("Shutting down AWS Copier...")
         self.running = False
