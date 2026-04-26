@@ -677,3 +677,90 @@ class TestFileListenerIgnoreIntegration:
         after = file_listener._stats["ignored_files"]
 
         assert after - before >= 1  # at least the .env file
+
+
+class TestBackupInfoMigrationAndCache:
+    """PERF-01 / PERF-02: backup info format migration and in-memory cache."""
+
+    async def test_load_migrates_old_string_format(self, file_listener, temp_watch_folder):
+        """Old string-format entries are migrated to {md5, mtime} dict on read (D-01)."""
+        import json
+
+        backup_file = temp_watch_folder / ".milo_backup.info"
+        backup_file.write_text(json.dumps({"files": {"a.txt": "abc123"}}))
+        result = await file_listener._load_backup_info(backup_file)
+        assert result == {"a.txt": {"md5": "abc123", "mtime": 0.0}}
+
+    async def test_load_preserves_new_dict_format(self, file_listener, temp_watch_folder):
+        """New dict-format entries pass through unchanged."""
+        import json
+
+        backup_file = temp_watch_folder / ".milo_backup.info"
+        payload = {"files": {"a.txt": {"md5": "abc123", "mtime": 1234.5}}}
+        backup_file.write_text(json.dumps(payload))
+        result = await file_listener._load_backup_info(backup_file)
+        assert result == {"a.txt": {"md5": "abc123", "mtime": 1234.5}}
+
+    async def test_load_returns_empty_when_file_missing(self, file_listener, temp_watch_folder):
+        """Non-existent backup info file returns empty dict."""
+        backup_file = temp_watch_folder / "does_not_exist.info"
+        result = await file_listener._load_backup_info(backup_file)
+        assert result == {}
+
+    async def test_load_uses_cache_when_disk_mtime_unchanged(self, file_listener, temp_watch_folder):
+        """Second call with same disk mtime hits the in-memory cache without re-reading disk (PERF-02)."""
+        import json
+
+        backup_file = temp_watch_folder / ".milo_backup.info"
+        backup_file.write_text(json.dumps({"files": {"a.txt": {"md5": "x", "mtime": 1.0}}}))
+        # First call populates cache
+        await file_listener._load_backup_info(backup_file)
+        # Spy on aiofiles.open via patch — second call must NOT read disk
+        import aws_copier.core.file_listener as flmod
+        from unittest.mock import patch
+
+        with patch.object(flmod, "aiofiles") as mock_af:
+            result = await file_listener._load_backup_info(backup_file)
+            mock_af.open.assert_not_called()
+        assert result == {"a.txt": {"md5": "x", "mtime": 1.0}}
+
+    async def test_load_re_reads_when_disk_mtime_changes(self, file_listener, temp_watch_folder):
+        """Disk read is triggered when .milo_backup.info mtime changes (cache miss)."""
+        import json
+        import time
+
+        backup_file = temp_watch_folder / ".milo_backup.info"
+        backup_file.write_text(json.dumps({"files": {"a.txt": {"md5": "old", "mtime": 1.0}}}))
+        first = await file_listener._load_backup_info(backup_file)
+        assert first["a.txt"]["md5"] == "old"
+        # Force a new mtime
+        time.sleep(0.05)
+        backup_file.write_text(json.dumps({"files": {"a.txt": {"md5": "new", "mtime": 2.0}}}))
+        second = await file_listener._load_backup_info(backup_file)
+        assert second["a.txt"]["md5"] == "new"
+
+    async def test_update_writes_dict_format(self, file_listener, temp_watch_folder):
+        """_update_backup_info writes {md5, mtime} dict values to disk (D-03)."""
+        import json
+
+        backup_file = temp_watch_folder / ".milo_backup.info"
+        payload = {"a.txt": {"md5": "x", "mtime": 1.0}}
+        ok = await file_listener._update_backup_info(backup_file, payload)
+        assert ok is True
+        raw = json.loads(backup_file.read_text())
+        assert raw["files"]["a.txt"] == {"md5": "x", "mtime": 1.0}
+
+    async def test_update_invalidates_cache(self, file_listener, temp_watch_folder):
+        """After _update_backup_info, subsequent _load_backup_info reflects the new content."""
+        import json
+
+        backup_file = temp_watch_folder / ".milo_backup.info"
+        backup_file.write_text(json.dumps({"files": {"a.txt": {"md5": "v1", "mtime": 1.0}}}))
+        # Prime cache
+        first = await file_listener._load_backup_info(backup_file)
+        assert first["a.txt"]["md5"] == "v1"
+        # Update through the API
+        await file_listener._update_backup_info(backup_file, {"a.txt": {"md5": "v2", "mtime": 2.0}})
+        # Subsequent load must reflect the update
+        second = await file_listener._load_backup_info(backup_file)
+        assert second["a.txt"]["md5"] == "v2"
