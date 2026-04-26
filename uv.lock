@@ -195,6 +195,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiobotocore" },
     { name = "aiofiles" },
+    { name = "aiohttp" },
     { name = "pathspec" },
     { name = "pyyaml" },
     { name = "watchdog" },
@@ -226,6 +227,7 @@ dev = [
 requires-dist = [
     { name = "aiobotocore", specifier = ">=2.24.1" },
     { name = "aiofiles", specifier = ">=24.1.0" },
+    { name = "aiohttp", specifier = ">=3.9.0" },
     { name = "black", marker = "extra == 'dev'", specifier = ">=23.0.0" },
     { name = "moto", extras = ["s3"], marker = "extra == 'dev'", specifier = ">=4.0.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.7.0" },

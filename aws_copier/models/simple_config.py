@@ -53,6 +53,10 @@ class SimpleConfig:
         # Upload settings
         self.max_concurrent_uploads: int = kwargs.get("max_concurrent_uploads", 100)
 
+        # Web dashboard settings
+        self.web_port: int = int(kwargs.get("web_port", 8765))
+        self.web_enabled: bool = bool(kwargs.get("web_enabled", True))
+
     @classmethod
     def load_from_yaml(cls, config_path: Path) -> "SimpleConfig":
         """Load configuration from YAML file."""

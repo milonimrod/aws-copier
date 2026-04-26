@@ -1,6 +1,7 @@
 """AWS Copier main entry point."""
 
 import asyncio
+import ctypes
 import logging
 import signal
 import sys
@@ -10,10 +11,33 @@ from aws_copier.core.file_listener import FileListener
 from aws_copier.core.folder_watcher import FolderWatcher
 from aws_copier.core.s3_manager import S3Manager
 from aws_copier.models.simple_config import SimpleConfig, load_config
+from aws_copier.web.dashboard import WebDashboard
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def _disable_quickedit_windows() -> None:
+    """Disable PowerShell/cmd QuickEdit mode on Windows so the process never freezes on click.
+
+    QuickEdit mode intercepts mouse clicks to start a selection, which pauses the process
+    until the user presses Enter/Escape. Disabling it lets the daemon run unattended.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        # STD_INPUT_HANDLE = -10
+        handle = kernel32.GetStdHandle(-10)
+        mode = ctypes.c_ulong(0)
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            # Clear ENABLE_QUICK_EDIT_MODE (0x0040) and ENABLE_MOUSE_INPUT (0x0010),
+            # keep ENABLE_EXTENDED_FLAGS (0x0080) so the clear takes effect.
+            new_mode = (mode.value & ~0x0040 & ~0x0010) | 0x0080
+            kernel32.SetConsoleMode(handle, new_mode)
+    except Exception as exc:
+        logger.warning(f"Could not disable QuickEdit mode: {exc}")
 
 
 class AWSCopierApp:
@@ -26,6 +50,9 @@ class AWSCopierApp:
         # Incremental backup components
         self.file_listener = FileListener(self.config, self.s3_manager)
         self.folder_watcher = FolderWatcher(self.config, self.file_listener)  # Real-time monitoring
+        self.web_dashboard = (
+            WebDashboard(self.file_listener, port=self.config.web_port) if self.config.web_enabled else None
+        )
         self.running = False
         self.shutdown_event = asyncio.Event()
 
@@ -34,6 +61,10 @@ class AWSCopierApp:
         logger.info("Starting AWS Copier (Simplified Architecture)...")
 
         try:
+            # Start web dashboard early so log capture begins immediately.
+            if self.web_dashboard is not None:
+                await self.web_dashboard.start()
+
             # Initialize S3 manager
             await self.s3_manager.initialize()
             logger.info("✅ S3 Manager initialized")
@@ -114,6 +145,11 @@ class AWSCopierApp:
             # Step 3: close S3 client.
             await self.s3_manager.close()
             logger.info("✅ S3 Manager closed")
+
+            # Step 4: shut down the web dashboard last so final log lines are visible.
+            if self.web_dashboard is not None:
+                await self.web_dashboard.stop()
+                logger.info("✅ Web dashboard stopped")
 
             logger.info("🛑 AWS Copier stopped successfully")
         except Exception as e:
@@ -196,6 +232,7 @@ async def main():
 
 def sync_main():
     """Synchronous main entry point for setuptools."""
+    _disable_quickedit_windows()
     try:
         exit_code = asyncio.run(main())
         sys.exit(exit_code)
