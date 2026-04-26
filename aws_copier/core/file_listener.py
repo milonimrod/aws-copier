@@ -38,7 +38,7 @@ class FileListener:
         self.upload_semaphore = asyncio.Semaphore(self.config.max_concurrent_uploads)
 
         # Separate semaphore for MD5 computation to avoid blocking uploads.
-        self.md5_semaphore = asyncio.Semaphore(50)
+        self.md5_semaphore = asyncio.Semaphore(10)
 
         # ASYNC-03: per-folder asyncio.Lock registry. Protects read-modify-write on
         # .milo_backup.info against concurrent scan + real-time event hitting the same folder.
