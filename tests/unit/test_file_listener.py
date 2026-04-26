@@ -109,7 +109,8 @@ class TestFileListenerCore:
 
         expected_md5 = hashlib.md5("Content of file 1".encode()).hexdigest()
 
-        assert root_data["files"]["file1.txt"] == expected_md5
+        # New format: each entry is a {md5, mtime} dict
+        assert root_data["files"]["file1.txt"]["md5"] == expected_md5
 
     async def test_incremental_scan_skips_unchanged_files(self, file_listener, temp_watch_folder):
         """Test that unchanged files are skipped on subsequent scans."""
@@ -390,8 +391,8 @@ class TestFileListenerBackupInfo:
     """Test FileListener backup info management."""
 
     async def test_load_backup_info_existing_file(self, file_listener, temp_watch_folder):
-        """Test loading existing backup info file."""
-        # Create a backup info file
+        """Test loading existing backup info file — old string format is migrated to {md5, mtime}."""
+        # Create a backup info file with the old string format
         backup_info_file = temp_watch_folder / ".milo_backup.info"
         test_data = {
             "timestamp": "2023-01-01T00:00:00",
@@ -401,10 +402,13 @@ class TestFileListenerBackupInfo:
         with open(backup_info_file, "w") as f:
             json.dump(test_data, f)
 
-        # Load backup info
+        # Load backup info — old string entries are migrated to new {md5, mtime} dict format (D-01)
         loaded_info = await file_listener._load_backup_info(backup_info_file)
 
-        assert loaded_info == test_data["files"]
+        assert loaded_info == {
+            "file1.txt": {"md5": "md5_hash_1", "mtime": 0.0},
+            "file2.txt": {"md5": "md5_hash_2", "mtime": 0.0},
+        }
 
     async def test_load_backup_info_nonexistent_file(self, file_listener, temp_watch_folder):
         """Test loading non-existent backup info file."""
@@ -415,9 +419,12 @@ class TestFileListenerBackupInfo:
         assert loaded_info == {}
 
     async def test_update_backup_info(self, file_listener, temp_watch_folder):
-        """Test updating backup info file."""
+        """Test updating backup info file with new {md5, mtime} dict format (D-03)."""
         backup_info_file = temp_watch_folder / ".milo_backup.info"
-        current_files = {"file1.txt": "md5_hash_1", "file2.txt": "md5_hash_2"}
+        current_files = {
+            "file1.txt": {"md5": "md5_hash_1", "mtime": 1.0},
+            "file2.txt": {"md5": "md5_hash_2", "mtime": 2.0},
+        }
 
         await file_listener._update_backup_info(backup_info_file, current_files)
 
@@ -559,14 +566,15 @@ class TestFileListenerAsyncBackupIO:
     """ASYNC-03: backup info I/O uses aiofiles under a per-folder asyncio.Lock."""
 
     async def test_load_backup_info_uses_aiofiles_and_lock(self, file_listener, tmp_path):
-        """Confirm _load_backup_info calls aiofiles.open and returns correct data."""
+        """Confirm _load_backup_info calls aiofiles.open and returns correct data (migrated to new format)."""
         from unittest.mock import patch
 
         backup_file = tmp_path / ".milo_backup.info"
+        # Write old string format — should be migrated to {md5, mtime} dict on load (D-01)
         backup_file.write_text('{"timestamp": "2026-01-01T00:00:00", "files": {"a.txt": "hash1"}}')
         with patch("aws_copier.core.file_listener.aiofiles.open", wraps=__import__("aiofiles").open) as mock_open:
             result = await file_listener._load_backup_info(backup_file)
-        assert result == {"a.txt": "hash1"}
+        assert result == {"a.txt": {"md5": "hash1", "mtime": 0.0}}
         assert mock_open.call_count == 1
 
     async def test_update_backup_info_uses_aiofiles_and_lock(self, file_listener, tmp_path):
@@ -574,14 +582,15 @@ class TestFileListenerAsyncBackupIO:
         from unittest.mock import patch
 
         backup_file = tmp_path / ".milo_backup.info"
+        new_format_files = {"a.txt": {"md5": "hash1", "mtime": 1.0}}
         with patch("aws_copier.core.file_listener.aiofiles.open", wraps=__import__("aiofiles").open) as mock_open:
-            await file_listener._update_backup_info(backup_file, {"a.txt": "hash1"})
+            await file_listener._update_backup_info(backup_file, new_format_files)
         assert backup_file.exists()
         assert mock_open.call_count == 1
         import json
 
         data = json.loads(backup_file.read_text())
-        assert data["files"] == {"a.txt": "hash1"}
+        assert data["files"] == new_format_files
 
     async def test_folder_lock_is_same_instance_per_folder(self, file_listener, tmp_path):
         """_get_folder_lock returns the same Lock instance for the same folder path."""

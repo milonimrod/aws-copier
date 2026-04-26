@@ -4,9 +4,10 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import aiofiles
 
@@ -41,6 +42,12 @@ class FileListener:
         # .milo_backup.info against concurrent scan + real-time event hitting the same folder.
         self._folder_locks: Dict[Path, asyncio.Lock] = {}
 
+        # PERF-02: in-memory backup info cache; keyed by Path (same type as _folder_locks).
+        # Mutations are guarded by the same per-folder lock as _load_backup_info /
+        # _update_backup_info, so reads/writes are serialised per folder.
+        self._backup_info_cache: Dict[Path, Dict[str, Any]] = {}
+        self._backup_info_mtime: Dict[Path, float] = {}
+
         # ASYNC-06 hook: active upload tasks tracked here so the shutdown drain can wait on them.
         # Tasks add themselves in _upload_files; done-callback discards them.
         self._active_upload_tasks: Set[asyncio.Task] = set()
@@ -70,6 +77,22 @@ class FileListener:
         if folder_path not in self._folder_locks:
             self._folder_locks[folder_path] = asyncio.Lock()
         return self._folder_locks[folder_path]
+
+    def _migrate_entry(self, value: Any) -> Dict[str, Any]:
+        """Migrate old string backup-info entry to new {md5, mtime} dict format.
+
+        D-01: Old entries (str MD5) are read as {md5: value, mtime: 0.0}. mtime=0.0
+        guarantees the next scan re-stats and writes the new format on first hit.
+
+        Args:
+            value: Raw entry from .milo_backup.info (str for old format, dict for new)
+
+        Returns:
+            Dict with keys 'md5' (str) and 'mtime' (float)
+        """
+        if isinstance(value, str):
+            return {"md5": value, "mtime": 0.0}
+        return value
 
     async def scan_all_folders(self) -> None:
         """Scan all configured watch folders using incremental backup approach."""
@@ -143,17 +166,22 @@ class FileListener:
         # Step 5: Update backup info file with successfully uploaded files only
         if uploaded_files:
             # Create updated backup info with only successfully uploaded files
-            updated_backup_info = existing_backup_info.copy()
+            updated_backup_info: Dict[str, Any] = existing_backup_info.copy()
 
-            # Add/update entries for successfully uploaded files
+            # Add/update entries for successfully uploaded files; normalise to new dict format
             for filename in uploaded_files:
-                if filename in current_files:
-                    updated_backup_info[filename] = current_files[filename]
+                entry = current_files.get(filename)
+                if entry is not None:
+                    updated_backup_info[filename] = (
+                        entry if isinstance(entry, dict) else {"md5": entry, "mtime": 0.0}
+                    )
 
             # Also include unchanged files that weren't uploaded (they're still valid)
-            for filename, md5_hash in current_files.items():
+            for filename, entry in current_files.items():
                 if filename not in files_to_upload:  # File wasn't changed, keep existing info
-                    updated_backup_info[filename] = md5_hash
+                    updated_backup_info[filename] = (
+                        entry if isinstance(entry, dict) else {"md5": entry, "mtime": 0.0}
+                    )
 
             await self._update_backup_info(backup_info_file, updated_backup_info)
             logger.info(
@@ -163,35 +191,54 @@ class FileListener:
             # Some files needed upload but none succeeded
             logger.warning(f"No files uploaded successfully in {folder_path}, backup info not updated")
         else:
-            # No files needed upload, but update backup info to include any new unchanged files
-            if current_files != existing_backup_info:
-                await self._update_backup_info(backup_info_file, current_files)
+            # No files needed upload, but update backup info to include any new unchanged files.
+            # Normalise current_files to new dict format before comparing/writing.
+            normalised_current: Dict[str, Any] = {
+                fname: (entry if isinstance(entry, dict) else {"md5": entry, "mtime": 0.0})
+                for fname, entry in current_files.items()
+            }
+            if normalised_current != existing_backup_info:
+                await self._update_backup_info(backup_info_file, normalised_current)
                 logger.info(f"Updated backup info for {folder_path} with unchanged files")
 
-    async def _load_backup_info(self, backup_info_file: Path) -> Dict[str, str]:
-        """Load existing backup info from .milo_backup.info file using aiofiles under a per-folder lock.
+    async def _load_backup_info(self, backup_info_file: Path) -> Dict[str, Dict[str, Any]]:
+        """Load backup info with in-memory cache and silent format migration.
 
-        ASYNC-03: async I/O via aiofiles; asyncio.Lock prevents interleaved reads during concurrent
-        scan + real-time event processing of the same folder.
+        PERF-02: Re-reads disk only when .milo_backup.info st_mtime changes.
+        PERF-01 / D-01: Migrates old string entries to {md5, mtime} dict on read.
+        ASYNC-03: Holds per-folder Lock during stat + read + cache update.
 
         Args:
-            backup_info_file: Path to backup info file
+            backup_info_file: Path to .milo_backup.info file
 
         Returns:
-            Dictionary mapping filename to MD5 hash
+            Dict mapping filename to {"md5": str, "mtime": float}. Empty dict if
+            the file does not exist or cannot be parsed.
         """
-        if not backup_info_file.exists():
-            return {}
-
-        try:
-            async with self._get_folder_lock(backup_info_file.parent):
+        folder = backup_info_file.parent
+        async with self._get_folder_lock(folder):
+            try:
+                disk_mtime = backup_info_file.stat().st_mtime
+            except FileNotFoundError:
+                return {}
+            # PERF-02: cache hit
+            if self._backup_info_mtime.get(folder) == disk_mtime:
+                return self._backup_info_cache.get(folder, {})
+            # cache miss: read from disk
+            try:
                 async with aiofiles.open(backup_info_file, "r", encoding="utf-8") as f:
                     content = await f.read()
-            data = json.loads(content)
-            return data.get("files", {})
-        except Exception as e:
-            logger.warning(f"Failed to load backup info from {backup_info_file}: {e}")
-            return {}
+                raw = json.loads(content).get("files", {})
+            except Exception as e:
+                logger.warning(f"Failed to load backup info from {backup_info_file}: {e}")
+                return {}
+            # PERF-01 / D-01: migrate entries
+            data: Dict[str, Dict[str, Any]] = {
+                name: self._migrate_entry(v) for name, v in raw.items()
+            }
+            self._backup_info_cache[folder] = data
+            self._backup_info_mtime[folder] = disk_mtime
+            return data
 
     async def _scan_current_files(self, folder_path: Path) -> Dict[str, str]:
         """Scan current folder and compute MD5 for all files in parallel.
@@ -245,21 +292,29 @@ class FileListener:
         return current_files
 
     def _determine_files_to_upload(
-        self, current_files: Dict[str, str], existing_backup_info: Dict[str, str]
+        self, current_files: Dict[str, Any], existing_backup_info: Dict[str, Any]
     ) -> List[str]:
         """Determine which files need to be uploaded.
 
+        Handles both the legacy string format and the new {md5, mtime} dict format
+        in existing_backup_info — extracts the md5 key when the entry is a dict.
+
         Args:
-            current_files: Current files and their MD5 hashes
-            existing_backup_info: Existing backup info with MD5 hashes
+            current_files: Current files mapping filename to MD5 string or {md5, mtime} dict
+            existing_backup_info: Existing backup info mapping filename to MD5 string or {md5, mtime} dict
 
         Returns:
             List of filenames that need to be uploaded
         """
         files_to_upload = []
 
-        for filename, current_md5 in current_files.items():
-            existing_md5 = existing_backup_info.get(filename)
+        for filename, current_entry in current_files.items():
+            # Support both bare MD5 strings (pre-Task-2) and new {md5, mtime} dicts
+            current_md5 = current_entry if isinstance(current_entry, str) else current_entry.get("md5")
+            existing_entry = existing_backup_info.get(filename)
+            existing_md5 = existing_entry if isinstance(existing_entry, str) else (
+                existing_entry.get("md5") if isinstance(existing_entry, dict) else None
+            )
 
             if existing_md5 != current_md5:
                 # File is new or has changed
@@ -419,23 +474,34 @@ class FileListener:
         # Fallback: use absolute path (shouldn't happen normally)
         return str(file_path).replace("\\", "/")
 
-    async def _update_backup_info(self, backup_info_file: Path, backup_files: Dict[str, str]) -> None:
+    async def _update_backup_info(self, backup_info_file: Path, backup_files: Dict[str, Dict[str, Any]]) -> bool:
         """Update the .milo_backup.info file using aiofiles under the per-folder lock.
 
         ASYNC-03: async write via aiofiles; asyncio.Lock prevents a simultaneous read
         from seeing a half-written file.
+        PERF-02: Updates in-memory cache after write and invalidates cached disk-mtime so
+        the next _load_backup_info re-stats and picks up the new disk timestamp.
 
         Args:
             backup_info_file: Path to backup info file
-            backup_files: Files and their MD5 hashes to record as backed up
+            backup_files: Files and their {md5, mtime} dicts to record as backed up
+
+        Returns:
+            True if the write succeeded, False otherwise.
         """
         backup_info = {"timestamp": datetime.now().isoformat(), "files": backup_files}
         try:
             async with self._get_folder_lock(backup_info_file.parent):
                 async with aiofiles.open(backup_info_file, "w", encoding="utf-8") as f:
                     await f.write(json.dumps(backup_info, indent=2))
+                # PERF-02: update cache with new content; invalidate cached disk mtime so the
+                # next _load_backup_info re-stats and picks up the OS-assigned mtime after write.
+                self._backup_info_cache[backup_info_file.parent] = backup_files
+                self._backup_info_mtime.pop(backup_info_file.parent, None)
+            return True
         except Exception as e:
             logger.error(f"Failed to update backup info {backup_info_file}: {e}")
+            return False
 
     async def _calculate_md5_with_semaphore(self, file_path: Path) -> Optional[str]:
         """Calculate MD5 hash of a file with semaphore control for parallel processing.
