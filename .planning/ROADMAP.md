@@ -52,7 +52,7 @@ Plans:
 - [x] 02-02-PLAN.md — FileListener backup info format migration + mtime skip + in-memory cache [PERF-01, PERF-02]
 - [x] 02-03-PLAN.md — S3Manager.upload_file precomputed_md5 + ensure_lifecycle_rule + chain-aware client kwargs [PERF-03, CONFIG-07]
 - [x] 02-04-PLAN.md — FolderWatcher 2-second per-path event debounce [PERF-04]
-- [ ] 02-05-PLAN.md — .backupignore cascade in FileListener + main.py lifecycle/credential-source wiring [CONFIG-06]
+- [x] 02-05-PLAN.md — .backupignore cascade in FileListener + main.py lifecycle/credential-source wiring [CONFIG-06]
 
 ## Progress
 
