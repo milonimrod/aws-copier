@@ -38,7 +38,7 @@ class FileListener:
         self.upload_semaphore = asyncio.Semaphore(self.config.max_concurrent_uploads)
 
         # Separate semaphore for MD5 computation to avoid blocking uploads.
-        self.md5_semaphore = asyncio.Semaphore(50)
+        self.md5_semaphore = asyncio.Semaphore(10)
 
         # ASYNC-03: per-folder asyncio.Lock registry. Protects read-modify-write on
         # .milo_backup.info against concurrent scan + real-time event hitting the same folder.
@@ -648,8 +648,8 @@ class FileListener:
         async with self.md5_semaphore:
             return await self._calculate_md5(file_path)
 
-    async def _calculate_md5(self, file_path: Path) -> Optional[str]:
-        """Calculate MD5 hash of a file using aiofiles for truly async I/O.
+    def _calculate_md5_sync(self, file_path: Path) -> Optional[str]:
+        """Synchronous MD5 computation for use inside asyncio.to_thread.
 
         Args:
             file_path: Path to file
@@ -659,17 +659,28 @@ class FileListener:
         """
         try:
             hasher = hashlib.md5()
-
-            # Use aiofiles for truly asynchronous file I/O
-            async with aiofiles.open(file_path, "rb") as f:
-                while chunk := await f.read(8192):
+            with open(file_path, "rb") as f:
+                for chunk in iter(lambda: f.read(1048576), b""):
                     hasher.update(chunk)
-
             return hasher.hexdigest()
-
         except Exception as e:
             logger.error(f"Error calculating MD5 for {file_path}: {e}")
             return None
+
+    async def _calculate_md5(self, file_path: Path) -> Optional[str]:
+        """Calculate MD5 hash of a file by offloading to a thread pool.
+
+        hashlib releases the GIL during C-level hashing, so multiple threads
+        can genuinely parallelize. 1MB chunks minimise per-chunk overhead vs
+        the old 8192-byte aiofiles loop.
+
+        Args:
+            file_path: Path to file
+
+        Returns:
+            MD5 hash as hex string, or None if error
+        """
+        return await asyncio.to_thread(self._calculate_md5_sync, file_path)
 
     def get_statistics(self) -> dict:
         """Get current statistics.

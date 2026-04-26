@@ -130,10 +130,12 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     });
 
     function connect() {
+      if (es) { es.close(); }
       es = new EventSource('/logs');
       es.onopen = () => connDot.classList.add('live');
       es.onerror = () => {
         connDot.classList.remove('live');
+        es.close();
         setTimeout(connect, 3000);
       };
       es.onmessage = (ev) => {
@@ -187,6 +189,18 @@ class LogBroadcaster(logging.Handler):
             except ValueError:
                 pass
 
+    def _enqueue(self, q: "asyncio.Queue[dict]", entry: dict) -> None:
+        """Ring-buffer enqueue: drop oldest if full. Must run on the event loop."""
+        if q.full():
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        try:
+            q.put_nowait(entry)
+        except asyncio.QueueFull:
+            pass
+
     def emit(self, record: logging.LogRecord) -> None:
         """Broadcast a formatted log record to all registered clients.
 
@@ -200,7 +214,7 @@ class LogBroadcaster(logging.Handler):
                 clients = list(self._clients)
             for q in clients:
                 try:
-                    self._loop.call_soon_threadsafe(q.put_nowait, entry)
+                    self._loop.call_soon_threadsafe(self._enqueue, q, entry)
                 except Exception:
                     pass
         except Exception:
@@ -266,9 +280,13 @@ class WebDashboard:
         self._broadcaster.add_client(queue)
         try:
             while True:
-                entry = await queue.get()
-                payload = f"data: {json.dumps(entry)}\n\n"
-                await response.write(payload.encode())
+                try:
+                    entry = await asyncio.wait_for(queue.get(), timeout=20.0)
+                    payload = f"data: {json.dumps(entry)}\n\n"
+                    await response.write(payload.encode())
+                except asyncio.TimeoutError:
+                    # SSE comment line — browser ignores it, keeps TCP alive
+                    await response.write(b": heartbeat\n\n")
         except (ConnectionResetError, asyncio.CancelledError):
             pass
         finally:
