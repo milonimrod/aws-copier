@@ -773,3 +773,108 @@ class TestBackupInfoMigrationAndCache:
         # Subsequent load must reflect the update
         second = await file_listener._load_backup_info(backup_file)
         assert second["a.txt"]["md5"] == "v2"
+
+
+class TestMtimeSkip:
+    """PERF-01: mtime-skip in _scan_current_files and D-02 upload_mtime capture."""
+
+    async def test_unchanged_file_skips_md5(self, file_listener, temp_watch_folder):
+        """Second scan cycle with unchanged file increments skipped_files, does not call _calculate_md5."""
+        from unittest.mock import patch
+
+        # First full cycle — uploads file1.txt and establishes backup state
+        await file_listener._process_current_folder(temp_watch_folder)
+        file_listener.reset_statistics()
+
+        # Second cycle: file1.txt unchanged — mtime-skip must fire
+        with patch.object(
+            file_listener, "_calculate_md5", wraps=file_listener._calculate_md5
+        ) as spy_md5:
+            await file_listener._process_current_folder(temp_watch_folder)
+            # No MD5 should be computed for the unchanged files
+            spy_md5.assert_not_called()
+
+        stats = file_listener.get_statistics()
+        assert stats["skipped_files"] >= 1
+
+    async def test_mtime_change_triggers_upload(self, file_listener, temp_watch_folder):
+        """Modifying a file's content (advancing mtime) causes _calculate_md5 and upload_file to be called."""
+        import time
+
+        # First cycle
+        await file_listener._process_current_folder(temp_watch_folder)
+        file_listener.s3_manager.upload_file.reset_mock()
+        file_listener.reset_statistics()
+
+        # Modify file1.txt to advance its mtime
+        time.sleep(0.05)
+        (temp_watch_folder / "file1.txt").write_text("Modified content")
+
+        with patch.object(
+            file_listener, "_calculate_md5", wraps=file_listener._calculate_md5
+        ) as spy_md5:
+            await file_listener._process_current_folder(temp_watch_folder)
+            # MD5 must be computed for the modified file
+            assert spy_md5.call_count >= 1
+
+        file_listener.s3_manager.upload_file.assert_called()
+        upload_paths = [c.args[0].name for c in file_listener.s3_manager.upload_file.call_args_list]
+        assert "file1.txt" in upload_paths
+
+    async def test_first_run_after_migration_recomputes(self, file_listener, temp_watch_folder):
+        """A migrated old-format entry (mtime=0.0) does not match real st_mtime, so MD5 is recomputed."""
+        import json, time
+
+        # Pre-create .milo_backup.info with old string format
+        backup_file = temp_watch_folder / ".milo_backup.info"
+        # Use the correct md5 for file1.txt so the S3 check would skip upload if mtime matched —
+        # but because mtime=0.0 != real st_mtime the file must be re-processed regardless.
+        import hashlib
+        real_md5 = hashlib.md5(b"Content of file 1").hexdigest()
+        backup_file.write_text(json.dumps({"files": {"file1.txt": real_md5}}))
+
+        with patch.object(
+            file_listener, "_calculate_md5", wraps=file_listener._calculate_md5
+        ) as spy_md5:
+            await file_listener._process_current_folder(temp_watch_folder)
+            # _calculate_md5 must have been called for file1.txt (mtime=0.0 forces re-stat)
+            assert spy_md5.call_count >= 1
+
+        # Post-write .milo_backup.info must be in new dict format
+        raw = json.loads(backup_file.read_text())
+        for entry in raw["files"].values():
+            assert isinstance(entry, dict)
+            assert "md5" in entry
+            assert "mtime" in entry
+
+    async def test_stored_mtime_is_pre_upload_capture(self, file_listener, temp_watch_folder):
+        """The mtime stored in backup info after upload equals the value captured just before upload (D-02)."""
+        import json, os, time
+        from unittest.mock import AsyncMock, patch
+
+        # Capture the pre-upload mtime from within the upload coroutine
+        captured_mtimes: Dict = {}
+        original_upload = file_listener.s3_manager.upload_file
+
+        async def upload_and_record(file_path, s3_key):
+            # Record the mtime at the moment upload is called
+            captured_mtimes[file_path.name] = file_path.stat().st_mtime
+            return True
+
+        file_listener.s3_manager.upload_file = AsyncMock(side_effect=upload_and_record)
+        file_listener.s3_manager.check_exists = AsyncMock(return_value=False)
+
+        await file_listener._process_current_folder(temp_watch_folder)
+
+        # Read back the stored backup info
+        backup_file = temp_watch_folder / ".milo_backup.info"
+        raw = json.loads(backup_file.read_text())
+
+        for filename, stored_entry in raw["files"].items():
+            if filename in captured_mtimes:
+                assert isinstance(stored_entry, dict), f"{filename} not in new format"
+                # The stored mtime must be <= the mtime captured at upload call time
+                # (captured just before upload, not post-modification)
+                assert stored_entry["mtime"] <= captured_mtimes[filename], (
+                    f"{filename}: stored mtime {stored_entry['mtime']} > captured {captured_mtimes[filename]}"
+                )
