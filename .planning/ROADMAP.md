@@ -45,7 +45,14 @@ Plans:
   2. AWS credentials work when `config.yaml` has no `aws_access_key_id` field, falling back to `~/.aws/credentials` or `AWS_*` environment variables
   3. A `.backupignore` file placed in a watched subdirectory causes files matching its patterns to be excluded from uploads for that directory
   4. At daemon startup, the configured S3 bucket has an `AbortIncompleteMultipartUpload` lifecycle rule set (or confirmed present), visible in the startup log
-**Plans**: TBD
+**Plans**: 5 plans
+
+Plans:
+- [x] 02-01-PLAN.md — Add pathspec dep + SimpleConfig credential chain detection [CONFIG-05]
+- [x] 02-02-PLAN.md — FileListener backup info format migration + mtime skip + in-memory cache [PERF-01, PERF-02]
+- [x] 02-03-PLAN.md — S3Manager.upload_file precomputed_md5 + ensure_lifecycle_rule + chain-aware client kwargs [PERF-03, CONFIG-07]
+- [x] 02-04-PLAN.md — FolderWatcher 2-second per-path event debounce [PERF-04]
+- [x] 02-05-PLAN.md — .backupignore cascade in FileListener + main.py lifecycle/credential-source wiring [CONFIG-06]
 
 ## Progress
 
@@ -55,4 +62,4 @@ Phases execute in numeric order: 1 → 2
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Core Reliability | 0/5 | Not started | - |
-| 2. Performance & Polish | 0/TBD | Not started | - |
+| 2. Performance & Polish | 0/5 | Not started | - |

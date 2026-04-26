@@ -12,11 +12,23 @@ class SimpleConfig:
     def __init__(self, **kwargs):
         """Initialize configuration with default values."""
         # AWS Configuration
-        self.aws_access_key_id: str = kwargs.get("aws_access_key_id", "YOUR_ACCESS_KEY_ID")
-        self.aws_secret_access_key: str = kwargs.get("aws_secret_access_key", "YOUR_SECRET_ACCESS_KEY")
+        self.aws_access_key_id: str = kwargs.get("aws_access_key_id", "") or ""
+        self.aws_secret_access_key: str = kwargs.get("aws_secret_access_key", "") or ""
         self.aws_region: str = kwargs.get("aws_region", "us-east-1")
         self.s3_bucket: str = kwargs.get("s3_bucket", "your-bucket-name")
         self.s3_prefix: str = kwargs.get("s3_prefix", "")
+
+        # CONFIG-05: detect whether to fall back to botocore provider chain.
+        # D-09: chain fallback only when key/secret are absent (None or empty), not when
+        # they contain placeholder strings — explicit config always wins.
+        raw_key = kwargs.get("aws_access_key_id")
+        raw_secret = kwargs.get("aws_secret_access_key")
+        self.use_credential_chain: bool = not raw_key or not raw_secret
+        # D-10: credential source label for audit logging in S3Manager.initialize()
+        if not self.use_credential_chain:
+            self.credential_source: str = "config.yaml"
+        else:
+            self.credential_source: str = "provider chain (env / ~/.aws/credentials / IAM)"
 
         # Folders to watch - support both list format (legacy) and dict format (new)
         watch_folders_data = kwargs.get("watch_folders", [str(Path.home() / "Documents")])

@@ -109,7 +109,8 @@ class TestFileListenerCore:
 
         expected_md5 = hashlib.md5("Content of file 1".encode()).hexdigest()
 
-        assert root_data["files"]["file1.txt"] == expected_md5
+        # New format: each entry is a {md5, mtime} dict
+        assert root_data["files"]["file1.txt"]["md5"] == expected_md5
 
     async def test_incremental_scan_skips_unchanged_files(self, file_listener, temp_watch_folder):
         """Test that unchanged files are skipped on subsequent scans."""
@@ -192,7 +193,7 @@ class TestFileListenerOperations:
         assert "file4.txt" in data["files"]
 
     async def test_scan_current_files(self, file_listener, temp_watch_folder):
-        """Test scanning files in a folder and computing MD5s."""
+        """Test scanning files in a folder — returns {md5, mtime} dicts (new format)."""
         folder_path = temp_watch_folder
 
         current_files = await file_listener._scan_current_files(folder_path)
@@ -201,11 +202,12 @@ class TestFileListenerOperations:
         assert "file2.txt" in current_files
         assert len(current_files) == 2  # Should not include subdirectories
 
-        # Verify MD5 calculation
+        # Verify MD5 calculation — new format wraps md5 in a dict
         import hashlib
 
         expected_md5 = hashlib.md5("Content of file 1".encode()).hexdigest()
-        assert current_files["file1.txt"] == expected_md5
+        assert current_files["file1.txt"]["md5"] == expected_md5
+        assert "mtime" in current_files["file1.txt"]
 
     async def test_determine_files_to_upload_new_files(self, file_listener):
         """Test determining which files need upload when all are new."""
@@ -239,51 +241,57 @@ class TestFileListenerUploads:
     """Test FileListener upload operations."""
 
     async def test_upload_files_success(self, file_listener, temp_watch_folder):
-        """Test successful file upload."""
+        """Test successful file upload — _upload_files now returns Dict[str, float]."""
         files_to_upload = ["file1.txt", "file2.txt"]
 
-        uploaded_files = await file_listener._upload_files(files_to_upload, temp_watch_folder)
+        upload_mtimes = await file_listener._upload_files(files_to_upload, temp_watch_folder)
 
-        # Concurrent gather returns all successfully uploaded filenames
-        assert len(uploaded_files) == 2
-        assert set(uploaded_files) == {"file1.txt", "file2.txt"}
+        # Concurrent gather returns a dict of successfully uploaded filename -> upload_mtime
+        assert len(upload_mtimes) == 2
+        assert set(upload_mtimes.keys()) == {"file1.txt", "file2.txt"}
+        # Each value is a float mtime
+        for mtime in upload_mtimes.values():
+            assert isinstance(mtime, float)
 
         # Verify S3Manager was called
         assert file_listener.s3_manager.upload_file.call_count == 2
 
     async def test_upload_files_with_s3_check_skip(self, file_listener, temp_watch_folder):
-        """Test upload with S3 existence check - files already exist."""
+        """Test upload with S3 existence check - files already exist in S3."""
         # Configure mock to return True for check_exists (file already exists)
         file_listener.s3_manager.check_exists.return_value = True
 
         files_to_upload = ["file1.txt"]
 
-        uploaded_files = await file_listener._upload_files(files_to_upload, temp_watch_folder)
+        upload_mtimes = await file_listener._upload_files(files_to_upload, temp_watch_folder)
 
-        # When check_exists returns True, _upload_single_file returns True, so filename is included
-        assert len(uploaded_files) == 1
-        assert uploaded_files[0] == "file1.txt"  # Correct behavior: filename returned
+        # When check_exists returns True, _upload_single_file returns (True, mtime), so filename is in dict
+        assert len(upload_mtimes) == 1
+        assert "file1.txt" in upload_mtimes
         file_listener.s3_manager.upload_file.assert_not_called()
 
     async def test_upload_single_file_success(self, file_listener, temp_watch_folder):
-        """Test uploading a single file."""
+        """Test uploading a single file — returns (True, mtime) tuple."""
         filename = "file1.txt"
 
-        result = await file_listener._upload_single_file(filename, temp_watch_folder)
+        ok, upload_mtime = await file_listener._upload_single_file(filename, temp_watch_folder)
 
-        assert result is True  # Returns True on success (not filename)
+        assert ok is True
+        assert isinstance(upload_mtime, float)
+        assert upload_mtime > 0.0
         file_listener.s3_manager.upload_file.assert_called_once()
 
     async def test_upload_single_file_already_exists(self, file_listener, temp_watch_folder):
-        """Test uploading a file that already exists in S3."""
+        """Test uploading a file that already exists in S3 — returns (True, mtime) tuple."""
         # Configure mock to return True for check_exists
         file_listener.s3_manager.check_exists.return_value = True
 
         filename = "file1.txt"
 
-        result = await file_listener._upload_single_file(filename, temp_watch_folder)
+        ok, upload_mtime = await file_listener._upload_single_file(filename, temp_watch_folder)
 
-        assert result is True  # Returns True even when skipped (current behavior)
+        assert ok is True
+        assert isinstance(upload_mtime, float)
         file_listener.s3_manager.upload_file.assert_not_called()
 
     async def test_concurrent_upload_with_semaphore(self, file_listener, temp_watch_folder):
@@ -296,10 +304,10 @@ class TestFileListenerUploads:
             (temp_watch_folder / filename).write_text(f"Content of {filename}")
 
         # Upload files
-        uploaded_files = await file_listener._upload_files(files_to_upload, temp_watch_folder)
+        upload_mtimes = await file_listener._upload_files(files_to_upload, temp_watch_folder)
 
         # All files should be uploaded
-        assert len(uploaded_files) == 10
+        assert len(upload_mtimes) == 10
 
         # Verify semaphore was used (check that upload_file was called for each file)
         assert file_listener.s3_manager.upload_file.call_count == 10
@@ -312,7 +320,7 @@ class TestFileListenerUploads:
             (temp_watch_folder / filename).write_text(f"content of {filename}")
 
         # Configure mock to simulate partial success
-        def mock_upload_side_effect(file_path, s3_key):
+        def mock_upload_side_effect(file_path, s3_key, **kwargs):
             filename = file_path.name
             return filename.startswith("success")  # Only "success*" files succeed
 
@@ -390,8 +398,8 @@ class TestFileListenerBackupInfo:
     """Test FileListener backup info management."""
 
     async def test_load_backup_info_existing_file(self, file_listener, temp_watch_folder):
-        """Test loading existing backup info file."""
-        # Create a backup info file
+        """Test loading existing backup info file — old string format is migrated to {md5, mtime}."""
+        # Create a backup info file with the old string format
         backup_info_file = temp_watch_folder / ".milo_backup.info"
         test_data = {
             "timestamp": "2023-01-01T00:00:00",
@@ -401,10 +409,13 @@ class TestFileListenerBackupInfo:
         with open(backup_info_file, "w") as f:
             json.dump(test_data, f)
 
-        # Load backup info
+        # Load backup info — old string entries are migrated to new {md5, mtime} dict format (D-01)
         loaded_info = await file_listener._load_backup_info(backup_info_file)
 
-        assert loaded_info == test_data["files"]
+        assert loaded_info == {
+            "file1.txt": {"md5": "md5_hash_1", "mtime": 0.0},
+            "file2.txt": {"md5": "md5_hash_2", "mtime": 0.0},
+        }
 
     async def test_load_backup_info_nonexistent_file(self, file_listener, temp_watch_folder):
         """Test loading non-existent backup info file."""
@@ -415,9 +426,12 @@ class TestFileListenerBackupInfo:
         assert loaded_info == {}
 
     async def test_update_backup_info(self, file_listener, temp_watch_folder):
-        """Test updating backup info file."""
+        """Test updating backup info file with new {md5, mtime} dict format (D-03)."""
         backup_info_file = temp_watch_folder / ".milo_backup.info"
-        current_files = {"file1.txt": "md5_hash_1", "file2.txt": "md5_hash_2"}
+        current_files = {
+            "file1.txt": {"md5": "md5_hash_1", "mtime": 1.0},
+            "file2.txt": {"md5": "md5_hash_2", "mtime": 2.0},
+        }
 
         await file_listener._update_backup_info(backup_info_file, current_files)
 
@@ -559,14 +573,15 @@ class TestFileListenerAsyncBackupIO:
     """ASYNC-03: backup info I/O uses aiofiles under a per-folder asyncio.Lock."""
 
     async def test_load_backup_info_uses_aiofiles_and_lock(self, file_listener, tmp_path):
-        """Confirm _load_backup_info calls aiofiles.open and returns correct data."""
+        """Confirm _load_backup_info calls aiofiles.open and returns correct data (migrated to new format)."""
         from unittest.mock import patch
 
         backup_file = tmp_path / ".milo_backup.info"
+        # Write old string format — should be migrated to {md5, mtime} dict on load (D-01)
         backup_file.write_text('{"timestamp": "2026-01-01T00:00:00", "files": {"a.txt": "hash1"}}')
         with patch("aws_copier.core.file_listener.aiofiles.open", wraps=__import__("aiofiles").open) as mock_open:
             result = await file_listener._load_backup_info(backup_file)
-        assert result == {"a.txt": "hash1"}
+        assert result == {"a.txt": {"md5": "hash1", "mtime": 0.0}}
         assert mock_open.call_count == 1
 
     async def test_update_backup_info_uses_aiofiles_and_lock(self, file_listener, tmp_path):
@@ -574,14 +589,15 @@ class TestFileListenerAsyncBackupIO:
         from unittest.mock import patch
 
         backup_file = tmp_path / ".milo_backup.info"
+        new_format_files = {"a.txt": {"md5": "hash1", "mtime": 1.0}}
         with patch("aws_copier.core.file_listener.aiofiles.open", wraps=__import__("aiofiles").open) as mock_open:
-            await file_listener._update_backup_info(backup_file, {"a.txt": "hash1"})
+            await file_listener._update_backup_info(backup_file, new_format_files)
         assert backup_file.exists()
         assert mock_open.call_count == 1
         import json
 
         data = json.loads(backup_file.read_text())
-        assert data["files"] == {"a.txt": "hash1"}
+        assert data["files"] == new_format_files
 
     async def test_folder_lock_is_same_instance_per_folder(self, file_listener, tmp_path):
         """_get_folder_lock returns the same Lock instance for the same folder path."""
@@ -601,7 +617,7 @@ class TestFileListenerConcurrentUpload:
         """10 files with 0.2s artificial delay each must finish in well under 2s (serial) — around 0.3s."""
         import time
 
-        async def slow_upload(file_path, s3_key):
+        async def slow_upload(file_path, s3_key, **kwargs):
             await asyncio.sleep(0.2)
             return True
 
@@ -638,7 +654,7 @@ class TestFileListenerConcurrentUpload:
         """One raising coroutine must not cancel the rest; return_exceptions=True preserves partial success."""
         calls = {"n": 0}
 
-        async def maybe_fail(file_path, s3_key):
+        async def maybe_fail(file_path, s3_key, **kwargs):
             calls["n"] += 1
             if calls["n"] == 2:
                 raise RuntimeError("simulated failure")
@@ -677,3 +693,272 @@ class TestFileListenerIgnoreIntegration:
         after = file_listener._stats["ignored_files"]
 
         assert after - before >= 1  # at least the .env file
+
+
+class TestBackupInfoMigrationAndCache:
+    """PERF-01 / PERF-02: backup info format migration and in-memory cache."""
+
+    async def test_load_migrates_old_string_format(self, file_listener, temp_watch_folder):
+        """Old string-format entries are migrated to {md5, mtime} dict on read (D-01)."""
+        import json
+
+        backup_file = temp_watch_folder / ".milo_backup.info"
+        backup_file.write_text(json.dumps({"files": {"a.txt": "abc123"}}))
+        result = await file_listener._load_backup_info(backup_file)
+        assert result == {"a.txt": {"md5": "abc123", "mtime": 0.0}}
+
+    async def test_load_preserves_new_dict_format(self, file_listener, temp_watch_folder):
+        """New dict-format entries pass through unchanged."""
+        import json
+
+        backup_file = temp_watch_folder / ".milo_backup.info"
+        payload = {"files": {"a.txt": {"md5": "abc123", "mtime": 1234.5}}}
+        backup_file.write_text(json.dumps(payload))
+        result = await file_listener._load_backup_info(backup_file)
+        assert result == {"a.txt": {"md5": "abc123", "mtime": 1234.5}}
+
+    async def test_load_returns_empty_when_file_missing(self, file_listener, temp_watch_folder):
+        """Non-existent backup info file returns empty dict."""
+        backup_file = temp_watch_folder / "does_not_exist.info"
+        result = await file_listener._load_backup_info(backup_file)
+        assert result == {}
+
+    async def test_load_uses_cache_when_disk_mtime_unchanged(self, file_listener, temp_watch_folder):
+        """Second call with same disk mtime hits the in-memory cache without re-reading disk (PERF-02)."""
+        import json
+
+        backup_file = temp_watch_folder / ".milo_backup.info"
+        backup_file.write_text(json.dumps({"files": {"a.txt": {"md5": "x", "mtime": 1.0}}}))
+        # First call populates cache
+        await file_listener._load_backup_info(backup_file)
+        # Spy on aiofiles.open via patch — second call must NOT read disk
+        import aws_copier.core.file_listener as flmod
+        from unittest.mock import patch
+
+        with patch.object(flmod, "aiofiles") as mock_af:
+            result = await file_listener._load_backup_info(backup_file)
+            mock_af.open.assert_not_called()
+        assert result == {"a.txt": {"md5": "x", "mtime": 1.0}}
+
+    async def test_load_re_reads_when_disk_mtime_changes(self, file_listener, temp_watch_folder):
+        """Disk read is triggered when .milo_backup.info mtime changes (cache miss)."""
+        import json
+        import time
+
+        backup_file = temp_watch_folder / ".milo_backup.info"
+        backup_file.write_text(json.dumps({"files": {"a.txt": {"md5": "old", "mtime": 1.0}}}))
+        first = await file_listener._load_backup_info(backup_file)
+        assert first["a.txt"]["md5"] == "old"
+        # Force a new mtime
+        time.sleep(0.05)
+        backup_file.write_text(json.dumps({"files": {"a.txt": {"md5": "new", "mtime": 2.0}}}))
+        second = await file_listener._load_backup_info(backup_file)
+        assert second["a.txt"]["md5"] == "new"
+
+    async def test_update_writes_dict_format(self, file_listener, temp_watch_folder):
+        """_update_backup_info writes {md5, mtime} dict values to disk (D-03)."""
+        import json
+
+        backup_file = temp_watch_folder / ".milo_backup.info"
+        payload = {"a.txt": {"md5": "x", "mtime": 1.0}}
+        ok = await file_listener._update_backup_info(backup_file, payload)
+        assert ok is True
+        raw = json.loads(backup_file.read_text())
+        assert raw["files"]["a.txt"] == {"md5": "x", "mtime": 1.0}
+
+    async def test_update_invalidates_cache(self, file_listener, temp_watch_folder):
+        """After _update_backup_info, subsequent _load_backup_info reflects the new content."""
+        import json
+
+        backup_file = temp_watch_folder / ".milo_backup.info"
+        backup_file.write_text(json.dumps({"files": {"a.txt": {"md5": "v1", "mtime": 1.0}}}))
+        # Prime cache
+        first = await file_listener._load_backup_info(backup_file)
+        assert first["a.txt"]["md5"] == "v1"
+        # Update through the API
+        await file_listener._update_backup_info(backup_file, {"a.txt": {"md5": "v2", "mtime": 2.0}})
+        # Subsequent load must reflect the update
+        second = await file_listener._load_backup_info(backup_file)
+        assert second["a.txt"]["md5"] == "v2"
+
+
+class TestMtimeSkip:
+    """PERF-01: mtime-skip in _scan_current_files and D-02 upload_mtime capture."""
+
+    async def test_unchanged_file_skips_md5(self, file_listener, temp_watch_folder):
+        """Second scan cycle with unchanged file increments skipped_files, does not call _calculate_md5."""
+        from unittest.mock import patch
+
+        # First full cycle — uploads file1.txt and establishes backup state
+        await file_listener._process_current_folder(temp_watch_folder)
+        file_listener.reset_statistics()
+
+        # Second cycle: file1.txt unchanged — mtime-skip must fire
+        with patch.object(
+            file_listener, "_calculate_md5", wraps=file_listener._calculate_md5
+        ) as spy_md5:
+            await file_listener._process_current_folder(temp_watch_folder)
+            # No MD5 should be computed for the unchanged files
+            spy_md5.assert_not_called()
+
+        stats = file_listener.get_statistics()
+        assert stats["skipped_files"] >= 1
+
+    async def test_mtime_change_triggers_upload(self, file_listener, temp_watch_folder):
+        """Modifying a file's content (advancing mtime) causes _calculate_md5 and upload_file to be called."""
+        import time
+        from unittest.mock import patch
+
+        # First cycle
+        await file_listener._process_current_folder(temp_watch_folder)
+        file_listener.s3_manager.upload_file.reset_mock()
+        file_listener.reset_statistics()
+
+        # Modify file1.txt to advance its mtime
+        time.sleep(0.05)
+        (temp_watch_folder / "file1.txt").write_text("Modified content")
+
+        with patch.object(
+            file_listener, "_calculate_md5", wraps=file_listener._calculate_md5
+        ) as spy_md5:
+            await file_listener._process_current_folder(temp_watch_folder)
+            # MD5 must be computed for the modified file
+            assert spy_md5.call_count >= 1
+
+        file_listener.s3_manager.upload_file.assert_called()
+        upload_paths = [c.args[0].name for c in file_listener.s3_manager.upload_file.call_args_list]
+        assert "file1.txt" in upload_paths
+
+    async def test_first_run_after_migration_recomputes(self, file_listener, temp_watch_folder):
+        """A migrated old-format entry (mtime=0.0) does not match real st_mtime, so MD5 is recomputed."""
+        import json
+        import hashlib
+        from unittest.mock import patch
+
+        # Pre-create .milo_backup.info with old string format
+        backup_file = temp_watch_folder / ".milo_backup.info"
+        # Use the correct md5 for file1.txt so the S3 check would skip upload if mtime matched —
+        # but because mtime=0.0 != real st_mtime the file must be re-processed regardless.
+        real_md5 = hashlib.md5(b"Content of file 1").hexdigest()
+        backup_file.write_text(json.dumps({"files": {"file1.txt": real_md5}}))
+
+        with patch.object(
+            file_listener, "_calculate_md5", wraps=file_listener._calculate_md5
+        ) as spy_md5:
+            await file_listener._process_current_folder(temp_watch_folder)
+            # _calculate_md5 must have been called for file1.txt (mtime=0.0 forces re-stat)
+            assert spy_md5.call_count >= 1
+
+        # Post-write .milo_backup.info must be in new dict format
+        raw = json.loads(backup_file.read_text())
+        for entry in raw["files"].values():
+            assert isinstance(entry, dict)
+            assert "md5" in entry
+            assert "mtime" in entry
+
+    async def test_stored_mtime_is_pre_upload_capture(self, file_listener, temp_watch_folder):
+        """The mtime stored in backup info after upload equals the value captured just before upload (D-02)."""
+        import json
+        from unittest.mock import AsyncMock
+
+        # Capture the pre-upload mtime from within the upload coroutine
+        captured_mtimes: dict = {}
+
+        async def upload_and_record(file_path, s3_key, **kwargs):
+            # Record the mtime at the moment upload is called
+            captured_mtimes[file_path.name] = file_path.stat().st_mtime
+            return True
+
+        file_listener.s3_manager.upload_file = AsyncMock(side_effect=upload_and_record)
+        file_listener.s3_manager.check_exists = AsyncMock(return_value=False)
+
+        await file_listener._process_current_folder(temp_watch_folder)
+
+        # Read back the stored backup info
+        backup_file = temp_watch_folder / ".milo_backup.info"
+        raw = json.loads(backup_file.read_text())
+
+        for filename, stored_entry in raw["files"].items():
+            if filename in captured_mtimes:
+                assert isinstance(stored_entry, dict), f"{filename} not in new format"
+                # The stored mtime must be <= the mtime captured at upload call time
+                # (captured just before upload, not post-modification)
+                assert stored_entry["mtime"] <= captured_mtimes[filename], (
+                    f"{filename}: stored mtime {stored_entry['mtime']} > captured {captured_mtimes[filename]}"
+                )
+
+
+class TestBackupignoreCascade:
+    """CONFIG-06: per-directory .backupignore with ancestor cascade (D-07, D-08)."""
+
+    async def test_root_backupignore_excludes_match(self, file_listener, temp_watch_folder, mock_s3_manager):
+        """Root .backupignore with '*.tmp' excludes matching files from upload."""
+        (temp_watch_folder / ".backupignore").write_text("*.tmp\n")
+        (temp_watch_folder / "keep.txt").write_text("k")
+        (temp_watch_folder / "drop.tmp").write_text("d")
+        await file_listener._process_current_folder(temp_watch_folder)
+        uploaded = [c.args[0].name for c in mock_s3_manager.upload_file.call_args_list]
+        assert "keep.txt" in uploaded
+        assert "drop.tmp" not in uploaded
+
+    async def test_root_backupignore_cascades_to_subdir(self, file_listener, temp_watch_folder, mock_s3_manager):
+        """D-07: root .backupignore patterns apply to all subdirectories."""
+        (temp_watch_folder / ".backupignore").write_text("*.tmp\n")
+        sub = temp_watch_folder / "photos"
+        sub.mkdir()
+        (sub / "keep.txt").write_text("k")
+        (sub / "drop.tmp").write_text("d")
+        await file_listener._process_current_folder(sub)
+        uploaded = [c.args[0].name for c in mock_s3_manager.upload_file.call_args_list]
+        assert "keep.txt" in uploaded
+        assert "drop.tmp" not in uploaded
+
+    async def test_child_backupignore_adds_to_root_rules(self, file_listener, temp_watch_folder, mock_s3_manager):
+        """D-08: child .backupignore adds to (not replaces) ancestor rules."""
+        (temp_watch_folder / ".backupignore").write_text("*.tmp\n")
+        sub = temp_watch_folder / "docs"
+        sub.mkdir()
+        (sub / ".backupignore").write_text("*.log\n")
+        (sub / "x.tmp").write_text("a")
+        (sub / "y.log").write_text("b")
+        (sub / "z.txt").write_text("c")
+        await file_listener._process_current_folder(sub)
+        uploaded = [c.args[0].name for c in mock_s3_manager.upload_file.call_args_list]
+        assert "z.txt" in uploaded
+        assert "x.tmp" not in uploaded
+        assert "y.log" not in uploaded
+
+    async def test_no_backupignore_no_filtering(self, file_listener, temp_watch_folder, mock_s3_manager):
+        """No .backupignore file means no filtering; all normal files are uploaded."""
+        (temp_watch_folder / "a.txt").write_text("a")
+        (temp_watch_folder / "b.txt").write_text("b")
+        await file_listener._process_current_folder(temp_watch_folder)
+        uploaded = sorted(c.args[0].name for c in mock_s3_manager.upload_file.call_args_list)
+        assert "a.txt" in uploaded
+        assert "b.txt" in uploaded
+
+    async def test_unreadable_backupignore_does_not_crash(self, file_listener, temp_watch_folder, caplog):
+        """Unreadable .backupignore logs a warning and returns a no-op PathSpec."""
+        import logging
+
+        ignore_file = temp_watch_folder / ".backupignore"
+        ignore_file.write_bytes(b"\xff\xfe\x00\x00not-utf8")  # binary; utf-8 decode fails
+        with caplog.at_level(logging.WARNING):
+            spec = file_listener._load_backupignore_spec(temp_watch_folder, temp_watch_folder)
+        assert any("Could not read" in r.message for r in caplog.records)
+        # Spec should be a valid no-op PathSpec
+        assert not spec.match_file("anything.tmp")
+
+    async def test_directory_scoped_pattern_matches_via_relative_path(
+        self, file_listener, temp_watch_folder, mock_s3_manager
+    ):
+        """Pitfall 4: directory-scoped patterns (raw/*.jpg) work when match_file uses relative paths with forward slashes."""
+        (temp_watch_folder / ".backupignore").write_text("raw/*.jpg\n")
+        raw = temp_watch_folder / "raw"
+        raw.mkdir()
+        (raw / "shot.jpg").write_text("img")
+        (raw / "notes.txt").write_text("n")
+        await file_listener._process_current_folder(raw)
+        uploaded = [c.args[0].name for c in mock_s3_manager.upload_file.call_args_list]
+        assert "notes.txt" in uploaded
+        assert "shot.jpg" not in uploaded

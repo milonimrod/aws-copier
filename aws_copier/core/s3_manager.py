@@ -7,7 +7,7 @@ import hashlib
 import logging
 from pathlib import Path
 import os
-from typing import Optional, Dict
+from typing import Any, Optional, Dict
 
 from aiobotocore.session import get_session
 from aiobotocore.config import AioConfig
@@ -30,16 +30,24 @@ class S3Manager:
         self._client_config = AioConfig(max_pool_connections=max_pool_connections)
 
     async def initialize(self) -> None:
-        """Initialize async S3 client using production pattern."""
+        """Initialize async S3 client using production pattern.
+
+        CONFIG-05: When config.use_credential_chain is True, explicit credentials are
+        omitted from create_client kwargs so aiobotocore traverses the standard
+        botocore provider chain (env vars → ~/.aws/credentials → IAM instance profile).
+        """
         try:
             # Test connection first with temporary client
-            async with self._session.create_client(
-                "s3",
-                aws_access_key_id=self.config.aws_access_key_id,
-                aws_secret_access_key=self.config.aws_secret_access_key,
-                region_name=self.config.aws_region,
-                config=self._client_config,
-            ) as test_client:
+            client_kwargs: Dict[str, Any] = {
+                "region_name": self.config.aws_region,
+                "config": self._client_config,
+            }
+            if not self.config.use_credential_chain:
+                client_kwargs["aws_access_key_id"] = self.config.aws_access_key_id
+                client_kwargs["aws_secret_access_key"] = self.config.aws_secret_access_key
+            # else: aiobotocore traverses env vars → ~/.aws/credentials → IAM instance profile
+
+            async with self._session.create_client("s3", **client_kwargs) as test_client:
                 await test_client.head_bucket(Bucket=self.config.s3_bucket)
 
             logger.info(f"S3Manager initialized for bucket: {self.config.s3_bucket}")
@@ -48,19 +56,117 @@ class S3Manager:
             logger.error(f"Failed to initialize S3Manager: {e}")
             raise
 
+    async def ensure_lifecycle_rule(self) -> None:
+        """Check or set AbortIncompleteMultipartUpload lifecycle rule on the bucket.
+
+        CONFIG-07: Protects against orphaned multipart upload parts accumulating cost
+        when uploads are interrupted (the daemon may be killed mid-upload).
+
+        D-11: Logs warning and returns (never raises) on any error — the daemon must
+        continue startup even if lifecycle rule cannot be set.
+        D-12: If any AbortIncompleteMultipartUpload rule already exists (any
+        DaysAfterInitiation), log info and skip. If other lifecycle rules exist but
+        none is AbortIncompleteMultipartUpload, log warning and skip — never overwrite
+        externally-set rules with put_bucket_lifecycle_configuration (which replaces
+        the entire lifecycle config, not a single rule).
+
+        Returns:
+            None
+        """
+        try:
+            client = await self._get_or_create_client()
+        except Exception as e:
+            logger.warning(
+                f"Could not verify multipart lifecycle rule: {e}. "
+                f"Incomplete uploads may accumulate cost."
+            )
+            return
+
+        existing_rules_present = False
+        try:
+            response = await client.get_bucket_lifecycle_configuration(
+                Bucket=self.config.s3_bucket
+            )
+            for rule in response.get("Rules", []):
+                existing_rules_present = True
+                abort = rule.get("AbortIncompleteMultipartUpload")
+                if abort:
+                    days = abort.get("DaysAfterInitiation", "?")
+                    logger.info(
+                        f"S3 lifecycle rule already present "
+                        f"(DaysAfterInitiation={days}). Skipping."
+                    )
+                    return
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code != "NoSuchLifecycleConfiguration":
+                logger.warning(
+                    f"Could not verify multipart lifecycle rule: {e}. "
+                    f"Incomplete uploads may accumulate cost."
+                )
+                return
+            # NoSuchLifecycleConfiguration → safe to create one
+        except Exception as e:
+            logger.warning(
+                f"Could not verify multipart lifecycle rule: {e}. "
+                f"Incomplete uploads may accumulate cost."
+            )
+            return
+
+        # D-12: never overwrite externally-set rules. If get returned other rules
+        # but none is AbortIncompleteMultipartUpload, warn and skip.
+        if existing_rules_present:
+            logger.warning(
+                "Could not verify multipart lifecycle rule: bucket has existing lifecycle "
+                "rules but none is AbortIncompleteMultipartUpload. "
+                "Incomplete uploads may accumulate cost."
+            )
+            return
+
+        # No lifecycle config at all → safe to create one.
+        try:
+            await client.put_bucket_lifecycle_configuration(
+                Bucket=self.config.s3_bucket,
+                LifecycleConfiguration={
+                    "Rules": [
+                        {
+                            "ID": "aws-copier-abort-incomplete-multipart",
+                            "Status": "Enabled",
+                            "Filter": {"Prefix": ""},
+                            "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1},
+                        }
+                    ]
+                },
+            )
+            logger.info(
+                "S3 lifecycle rule set: AbortIncompleteMultipartUpload after 1 day."
+            )
+        except Exception as e:
+            logger.warning(
+                f"Could not verify multipart lifecycle rule: {e}. "
+                f"Incomplete uploads may accumulate cost."
+            )
+
     async def _get_or_create_client(self):
-        """Get or create S3 client using AsyncExitStack pattern (like your production code)."""
+        """Get or create S3 client using AsyncExitStack pattern (like your production code).
+
+        CONFIG-05: When config.use_credential_chain is True, explicit credentials are
+        omitted from create_client kwargs so aiobotocore traverses the standard
+        botocore provider chain (env vars → ~/.aws/credentials → IAM instance profile).
+        """
         if not self._exit_stack:
             self._exit_stack = contextlib.AsyncExitStack()
         if not self._s3_client:
+            client_kwargs: Dict[str, Any] = {
+                "region_name": self.config.aws_region,
+                "config": self._client_config,
+            }
+            if not self.config.use_credential_chain:
+                client_kwargs["aws_access_key_id"] = self.config.aws_access_key_id
+                client_kwargs["aws_secret_access_key"] = self.config.aws_secret_access_key
+            # else: aiobotocore traverses env vars → ~/.aws/credentials → IAM instance profile
             self._s3_client = await self._exit_stack.enter_async_context(
-                self._session.create_client(
-                    "s3",
-                    aws_access_key_id=self.config.aws_access_key_id,
-                    aws_secret_access_key=self.config.aws_secret_access_key,
-                    region_name=self.config.aws_region,
-                    config=self._client_config,
-                )
+                self._session.create_client("s3", **client_kwargs)
             )
         return self._s3_client
 
@@ -74,12 +180,20 @@ class S3Manager:
             self._exit_stack = None
         logger.debug("S3Manager closed")
 
-    async def upload_file(self, local_path: Path, s3_key: str) -> bool:
+    async def upload_file(
+        self,
+        local_path: Path,
+        s3_key: str,
+        precomputed_md5: Optional[str] = None,  # PERF-03 / D-05
+    ) -> bool:
         """Upload file to S3 with MD5 checksum verification.
 
         Args:
             local_path: Path to local file
             s3_key: S3 object key
+            precomputed_md5: Pre-computed MD5 hex string. When provided, skips internal
+                _calculate_md5 call (PERF-03). None triggers internal computation
+                (backward-compatible default).
 
         Returns:
             True if upload successful, False otherwise
@@ -89,8 +203,8 @@ class S3Manager:
                 logger.error(f"File not found: {local_path}")
                 return False
 
-            # Calculate MD5 checksum
-            md5_hash = await self._calculate_md5(local_path)
+            # PERF-03: prefer caller-provided hash to avoid double computation.
+            md5_hash = precomputed_md5 or await self._calculate_md5(local_path)
             if not md5_hash:
                 logger.error(f"Failed to calculate MD5 for: {local_path}")
                 return False
