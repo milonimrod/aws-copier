@@ -210,10 +210,10 @@ class TestFileChangeHandler:
 
         with (
             patch("aws_copier.core.folder_watcher.asyncio.run_coroutine_threadsafe") as mock_run,
-            patch.object(file_change_handler, "_process_changed_file") as mock_process,
+            patch.object(file_change_handler, "_schedule_debounced") as mock_schedule,
         ):
-            # mock_process returns a coroutine object when called
-            mock_process.return_value = MagicMock(name="coroutine")
+            # mock_schedule returns a coroutine object when called
+            mock_schedule.return_value = MagicMock(name="coroutine")
             file_change_handler.on_any_event(event)
 
         # Assert: the new API was used exactly once with the handler's event_loop
@@ -229,7 +229,7 @@ class TestFileChangeHandler:
 
         with (
             patch("aws_copier.core.folder_watcher.asyncio.run_coroutine_threadsafe"),
-            patch.object(file_change_handler, "_process_changed_file"),
+            patch.object(file_change_handler, "_schedule_debounced"),
         ):
             file_change_handler.on_any_event(event)
 
@@ -257,12 +257,12 @@ class TestFileChangeHandler:
 
         event = FileModifiedEvent(str(test_file))
 
-        # Mock _process_changed_file to avoid coroutine creation
+        # Mock _schedule_debounced to avoid coroutine creation
         with (
             patch("aws_copier.core.folder_watcher.asyncio.run_coroutine_threadsafe") as mock_run,
-            patch.object(file_change_handler, "_process_changed_file") as mock_process,
+            patch.object(file_change_handler, "_schedule_debounced") as mock_schedule,
         ):
-            mock_process.return_value = MagicMock(name="coroutine")
+            mock_schedule.return_value = MagicMock(name="coroutine")
             file_change_handler.on_any_event(event)
 
             # Verify run_coroutine_threadsafe was called

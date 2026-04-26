@@ -39,6 +39,11 @@ class FileChangeHandler(FileSystemEventHandler):
         self.watch_folder = watch_folder
         self.file_listener = file_listener
         self.event_loop = event_loop
+        # PERF-04: per-path debounce state. Dict[str, asyncio.Task] is accessed only
+        # from the asyncio event loop thread (via run_coroutine_threadsafe), so no
+        # additional locking is needed. The 2-second window and per-path keying are
+        # locked by D-06.
+        self._debounce_tasks: Dict[str, asyncio.Task] = {}
 
     def on_any_event(self, event: FileSystemEvent) -> None:
         """Handle any file system event."""
@@ -62,15 +67,69 @@ class FileChangeHandler(FileSystemEventHandler):
                 return
 
             # Schedule async processing via run_coroutine_threadsafe (ASYNC-01).
+            # PERF-04: route through _schedule_debounced so a 2-second per-path window
+            # collapses rapid events (atomic-save patterns) into one _process_changed_file call.
             # Returns a concurrent.futures.Future; do NOT call .result() here — that would
             # deadlock the watchdog thread waiting on the main asyncio loop.
             asyncio.run_coroutine_threadsafe(
-                self._process_changed_file(file_path, event.event_type),
+                self._schedule_debounced(file_path, event.event_type),
                 self.event_loop,
             )
 
         except Exception as e:
             logger.error(f"Error handling file system event: {e}")
+
+    async def _schedule_debounced(self, file_path: Path, event_type: str) -> None:
+        """Schedule a debounced _process_changed_file call for file_path.
+
+        D-06: Cancels any pending debounce task for this path and creates a fresh
+        2-second timer. Dict access is safe — this coroutine always runs in the
+        asyncio event loop thread (scheduled via run_coroutine_threadsafe).
+
+        Args:
+            file_path: Path that triggered the file system event
+            event_type: watchdog event type string (created, modified, etc.)
+        """
+        key = str(file_path)
+        existing = self._debounce_tasks.get(key)
+        if existing is not None and not existing.done():
+            existing.cancel()
+        task = asyncio.create_task(
+            self._debounced_process(file_path, event_type),
+            name=f"debounce-{file_path.name}",
+        )
+        self._debounce_tasks[key] = task
+
+    async def _debounced_process(self, file_path: Path, event_type: str) -> None:
+        """Sleep 2 seconds then delegate to _process_changed_file.
+
+        CancelledError is caught and silenced — it means a newer event superseded
+        this one, which is normal behaviour, not an error.
+
+        Args:
+            file_path: Path to process after debounce window elapses
+            event_type: watchdog event type string
+        """
+        try:
+            await asyncio.sleep(2)
+            await self._process_changed_file(file_path, event_type)
+        except asyncio.CancelledError:
+            # Superseded by a newer event for the same path — normal, not an error.
+            pass
+
+    def cancel_all_pending(self) -> None:
+        """Cancel all pending debounce tasks (Pitfall 2 guard).
+
+        Called from FolderWatcher.stop() before observer.stop() to prevent
+        "RuntimeError: Event loop is closed" from tasks firing after shutdown.
+
+        Returns:
+            None
+        """
+        for task in list(self._debounce_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._debounce_tasks.clear()
 
     async def _process_changed_file(self, file_path: Path, event_type: str) -> None:
         """Process a changed file using incremental backup logic.
@@ -154,6 +213,11 @@ class FolderWatcher:
             return
 
         logger.info("Stopping folder watcher")
+
+        # PERF-04 / Pitfall 2: cancel pending debounce tasks before stopping the
+        # observer so they cannot fire after the event loop starts shutting down.
+        for handler in self.handlers.values():
+            handler.cancel_all_pending()
 
         # Stop the observer
         self.observer.stop()
