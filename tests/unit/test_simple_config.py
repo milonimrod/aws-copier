@@ -255,3 +255,61 @@ def test_legacy_config_with_discovered_files_folder_ignored(tmp_path):
     config = SimpleConfig.load_from_yaml(legacy_yaml)
     assert config.max_concurrent_uploads == 25
     assert not hasattr(config, "discovered_files_folder")
+
+
+class TestCredentialChainDetection:
+    """CONFIG-05: SimpleConfig detects whether to use AWS provider chain."""
+
+    def test_credential_chain_when_keys_absent(self):
+        config = SimpleConfig()
+        assert config.use_credential_chain is True
+        assert config.credential_source == "provider chain (env / ~/.aws/credentials / IAM)"
+
+    def test_credential_chain_when_key_empty_string(self):
+        config = SimpleConfig(aws_access_key_id="", aws_secret_access_key="")
+        assert config.use_credential_chain is True
+
+    def test_explicit_creds_used_when_both_present(self):
+        config = SimpleConfig(
+            aws_access_key_id="AKIA1234EXAMPLE",
+            aws_secret_access_key="secretvalue",
+        )
+        assert config.use_credential_chain is False
+        assert config.credential_source == "config.yaml"
+
+    def test_explicit_creds_when_only_key_present(self):
+        # D-09: BOTH must be present to use config.yaml
+        config = SimpleConfig(aws_access_key_id="AKIA1234EXAMPLE")
+        assert config.use_credential_chain is True
+
+    def test_explicit_creds_when_only_secret_present(self):
+        config = SimpleConfig(aws_secret_access_key="secretvalue")
+        assert config.use_credential_chain is True
+
+    def test_to_dict_excludes_derived_fields(self):
+        config = SimpleConfig()
+        d = config.to_dict()
+        assert "use_credential_chain" not in d
+        assert "credential_source" not in d
+
+    def test_save_yaml_excludes_derived_fields(self, tmp_path):
+        config = SimpleConfig()
+        config_path = tmp_path / "config.yaml"
+        config.save_to_yaml(config_path)
+        text = config_path.read_text()
+        assert "use_credential_chain" not in text
+        assert "credential_source" not in text
+
+    def test_round_trip_re_derives_use_credential_chain(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        # Manually write YAML with NO aws_access_key_id / aws_secret_access_key
+        import yaml
+        config_path.write_text(yaml.dump({
+            "aws_region": "us-east-1",
+            "s3_bucket": "test-bucket",
+            "s3_prefix": "backup",
+            "watch_folders": ["/tmp"],
+        }))
+        loaded = SimpleConfig.load_from_yaml(config_path)
+        assert loaded.use_credential_chain is True
+        assert loaded.credential_source == "provider chain (env / ~/.aws/credentials / IAM)"
