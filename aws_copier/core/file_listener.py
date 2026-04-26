@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import aiofiles
+from pathspec import PathSpec
 
 from aws_copier.core.ignore_rules import IGNORE_RULES
 from aws_copier.core.s3_manager import S3Manager
@@ -94,6 +95,62 @@ class FileListener:
             return {"md5": value, "mtime": 0.0}
         return value
 
+    def _resolve_watch_root(self, folder_path: Path) -> Path:
+        """Find the configured watch folder that is an ancestor of folder_path.
+
+        Args:
+            folder_path: Directory being scanned
+
+        Returns:
+            The watch root Path that contains folder_path, or folder_path itself
+            as a fallback when no watch folder is an ancestor.
+        """
+        for watch_folder in self.config.watch_folders:
+            try:
+                folder_path.relative_to(watch_folder)
+                return watch_folder
+            except ValueError:
+                continue
+        # Fallback: treat folder_path itself as root (no ancestor cascade)
+        return folder_path
+
+    def _load_backupignore_spec(self, folder_path: Path, watch_root: Path) -> PathSpec:
+        """Accumulate .backupignore patterns from watch_root down to folder_path.
+
+        D-07: Patterns cascade into subdirectories — a rule in /photos/.backupignore
+              applies to /photos/2024/ as well.
+        D-08: Child directory rules ADD to (not replace) ancestor rules.
+              Evaluated in path order: root → parent → child.
+        Pitfall 4: Caller must pass the path relative to watch_root (with forward
+                   slashes) to spec.match_file; absolute paths silently fail.
+
+        Args:
+            folder_path: Current directory being scanned
+            watch_root: Root watch folder (ancestor boundary)
+
+        Returns:
+            PathSpec compiled from all applicable .backupignore files. If none
+            exist or all reads fail, the returned spec matches no files.
+        """
+        all_patterns: List[str] = []
+        try:
+            parts = folder_path.relative_to(watch_root).parts
+        except ValueError:
+            parts = ()
+        current = watch_root
+        # Walk root → ... → folder_path, collecting .backupignore files in path order
+        for part in ("",) + parts:
+            if part:
+                current = current / part
+            ignore_file = current / ".backupignore"
+            if ignore_file.exists():
+                try:
+                    lines = ignore_file.read_text(encoding="utf-8").splitlines()
+                    all_patterns.extend(lines)
+                except Exception as e:
+                    logger.warning(f"Could not read {ignore_file}: {e}")
+        return PathSpec.from_lines("gitignore", all_patterns)
+
     async def scan_all_folders(self) -> None:
         """Scan all configured watch folders using incremental backup approach."""
         logger.info("Starting incremental backup scan of all watch folders")
@@ -155,7 +212,8 @@ class FileListener:
         existing_backup_info = await self._load_backup_info(backup_info_file)
 
         # Step 2: Scan current files — pass existing_backup_info for PERF-01 mtime-skip
-        current_files = await self._scan_current_files(folder_path, existing_backup_info)
+        watch_root = self._resolve_watch_root(folder_path)
+        current_files = await self._scan_current_files(folder_path, existing_backup_info, watch_root)
 
         # Step 3: Compare with existing backup info
         files_to_upload = self._determine_files_to_upload(current_files, existing_backup_info)
@@ -243,6 +301,7 @@ class FileListener:
         self,
         folder_path: Path,
         existing_backup_info: Optional[Dict[str, Dict[str, Any]]] = None,
+        watch_root: Optional[Path] = None,
     ) -> Dict[str, Dict[str, Any]]:
         """Scan current folder and compute MD5 for changed files; skip unchanged via mtime (PERF-01).
 
@@ -251,12 +310,20 @@ class FileListener:
             existing_backup_info: Previously stored backup info dict (from _load_backup_info).
                 When provided, files whose st_mtime matches the stored mtime are skipped —
                 MD5 is not recomputed. Pass None or {} to force full recomputation.
+            watch_root: The ancestor watch root for this folder_path; used to build the
+                cascaded .backupignore PathSpec (CONFIG-06). Defaults to folder_path
+                itself when not provided (no ancestor cascade).
 
         Returns:
             Dictionary mapping filename to {"md5": str, "mtime": float}
         """
         if existing_backup_info is None:
             existing_backup_info = {}
+        if watch_root is None:
+            watch_root = folder_path
+
+        # CONFIG-06: build cascaded .backupignore spec for this folder (D-07, D-08)
+        backupignore_spec = self._load_backupignore_spec(folder_path, watch_root)
 
         current_files: Dict[str, Dict[str, Any]] = {}
 
@@ -268,6 +335,17 @@ class FileListener:
                     continue
                 # IGNORE-03: delegate to IGNORE_RULES; IGNORE-04: count ignored files in stats
                 if IGNORE_RULES.should_ignore_file(file_path):
+                    self._stats["ignored_files"] += 1
+                    continue
+
+                # CONFIG-06: per-directory .backupignore filtering. Match input must be the
+                # path relative to watch_root with forward slashes (Pitfall 4).
+                try:
+                    relative = file_path.relative_to(watch_root)
+                except ValueError:
+                    relative = Path(file_path.name)
+                relative_str = str(relative).replace("\\", "/")
+                if backupignore_spec.match_file(relative_str):
                     self._stats["ignored_files"] += 1
                     continue
 

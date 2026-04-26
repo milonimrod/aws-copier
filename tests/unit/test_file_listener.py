@@ -886,3 +886,79 @@ class TestMtimeSkip:
                 assert stored_entry["mtime"] <= captured_mtimes[filename], (
                     f"{filename}: stored mtime {stored_entry['mtime']} > captured {captured_mtimes[filename]}"
                 )
+
+
+class TestBackupignoreCascade:
+    """CONFIG-06: per-directory .backupignore with ancestor cascade (D-07, D-08)."""
+
+    async def test_root_backupignore_excludes_match(self, file_listener, temp_watch_folder, mock_s3_manager):
+        """Root .backupignore with '*.tmp' excludes matching files from upload."""
+        (temp_watch_folder / ".backupignore").write_text("*.tmp\n")
+        (temp_watch_folder / "keep.txt").write_text("k")
+        (temp_watch_folder / "drop.tmp").write_text("d")
+        await file_listener._process_current_folder(temp_watch_folder)
+        uploaded = [c.args[0].name for c in mock_s3_manager.upload_file.call_args_list]
+        assert "keep.txt" in uploaded
+        assert "drop.tmp" not in uploaded
+
+    async def test_root_backupignore_cascades_to_subdir(self, file_listener, temp_watch_folder, mock_s3_manager):
+        """D-07: root .backupignore patterns apply to all subdirectories."""
+        (temp_watch_folder / ".backupignore").write_text("*.tmp\n")
+        sub = temp_watch_folder / "photos"
+        sub.mkdir()
+        (sub / "keep.txt").write_text("k")
+        (sub / "drop.tmp").write_text("d")
+        await file_listener._process_current_folder(sub)
+        uploaded = [c.args[0].name for c in mock_s3_manager.upload_file.call_args_list]
+        assert "keep.txt" in uploaded
+        assert "drop.tmp" not in uploaded
+
+    async def test_child_backupignore_adds_to_root_rules(self, file_listener, temp_watch_folder, mock_s3_manager):
+        """D-08: child .backupignore adds to (not replaces) ancestor rules."""
+        (temp_watch_folder / ".backupignore").write_text("*.tmp\n")
+        sub = temp_watch_folder / "docs"
+        sub.mkdir()
+        (sub / ".backupignore").write_text("*.log\n")
+        (sub / "x.tmp").write_text("a")
+        (sub / "y.log").write_text("b")
+        (sub / "z.txt").write_text("c")
+        await file_listener._process_current_folder(sub)
+        uploaded = [c.args[0].name for c in mock_s3_manager.upload_file.call_args_list]
+        assert "z.txt" in uploaded
+        assert "x.tmp" not in uploaded
+        assert "y.log" not in uploaded
+
+    async def test_no_backupignore_no_filtering(self, file_listener, temp_watch_folder, mock_s3_manager):
+        """No .backupignore file means no filtering; all normal files are uploaded."""
+        (temp_watch_folder / "a.txt").write_text("a")
+        (temp_watch_folder / "b.txt").write_text("b")
+        await file_listener._process_current_folder(temp_watch_folder)
+        uploaded = sorted(c.args[0].name for c in mock_s3_manager.upload_file.call_args_list)
+        assert "a.txt" in uploaded
+        assert "b.txt" in uploaded
+
+    async def test_unreadable_backupignore_does_not_crash(self, file_listener, temp_watch_folder, caplog):
+        """Unreadable .backupignore logs a warning and returns a no-op PathSpec."""
+        import logging
+
+        ignore_file = temp_watch_folder / ".backupignore"
+        ignore_file.write_bytes(b"\xff\xfe\x00\x00not-utf8")  # binary; utf-8 decode fails
+        with caplog.at_level(logging.WARNING):
+            spec = file_listener._load_backupignore_spec(temp_watch_folder, temp_watch_folder)
+        assert any("Could not read" in r.message for r in caplog.records)
+        # Spec should be a valid no-op PathSpec
+        assert not spec.match_file("anything.tmp")
+
+    async def test_directory_scoped_pattern_matches_via_relative_path(
+        self, file_listener, temp_watch_folder, mock_s3_manager
+    ):
+        """Pitfall 4: directory-scoped patterns (raw/*.jpg) work when match_file uses relative paths with forward slashes."""
+        (temp_watch_folder / ".backupignore").write_text("raw/*.jpg\n")
+        raw = temp_watch_folder / "raw"
+        raw.mkdir()
+        (raw / "shot.jpg").write_text("img")
+        (raw / "notes.txt").write_text("n")
+        await file_listener._process_current_folder(raw)
+        uploaded = [c.args[0].name for c in mock_s3_manager.upload_file.call_args_list]
+        assert "notes.txt" in uploaded
+        assert "shot.jpg" not in uploaded
