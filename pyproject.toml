@@ -9,6 +9,7 @@ dependencies = [
     "watchdog>=3.0.0", # File system monitoring
     "pyyaml>=6.0.2", # YAML configuration
     "aiofiles>=24.1.0",
+    "pathspec>=0.9.0", # gitignore-style pattern matching for .backupignore (CONFIG-06)
 ]
 
 [project.optional-dependencies]
