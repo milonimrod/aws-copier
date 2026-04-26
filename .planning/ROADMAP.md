@@ -48,10 +48,10 @@ Plans:
 **Plans**: 5 plans
 
 Plans:
-- [ ] 02-01-PLAN.md — Add pathspec dep + SimpleConfig credential chain detection [CONFIG-05]
-- [ ] 02-02-PLAN.md — FileListener backup info format migration + mtime skip + in-memory cache [PERF-01, PERF-02]
+- [x] 02-01-PLAN.md — Add pathspec dep + SimpleConfig credential chain detection [CONFIG-05]
+- [x] 02-02-PLAN.md — FileListener backup info format migration + mtime skip + in-memory cache [PERF-01, PERF-02]
 - [ ] 02-03-PLAN.md — S3Manager.upload_file precomputed_md5 + ensure_lifecycle_rule + chain-aware client kwargs [PERF-03, CONFIG-07]
-- [ ] 02-04-PLAN.md — FolderWatcher 2-second per-path event debounce [PERF-04]
+- [x] 02-04-PLAN.md — FolderWatcher 2-second per-path event debounce [PERF-04]
 - [ ] 02-05-PLAN.md — .backupignore cascade in FileListener + main.py lifecycle/credential-source wiring [CONFIG-06]
 
 ## Progress
