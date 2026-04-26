@@ -154,27 +154,30 @@ class FileListener:
         # Step 1: Load existing backup info
         existing_backup_info = await self._load_backup_info(backup_info_file)
 
-        # Step 2: Scan current files and compute MD5s
-        current_files = await self._scan_current_files(folder_path)
+        # Step 2: Scan current files — pass existing_backup_info for PERF-01 mtime-skip
+        current_files = await self._scan_current_files(folder_path, existing_backup_info)
 
         # Step 3: Compare with existing backup info
         files_to_upload = self._determine_files_to_upload(current_files, existing_backup_info)
 
-        # Step 4: Upload changed/new files
-        uploaded_files = await self._upload_files(files_to_upload, folder_path)
+        # Step 4: Upload changed/new files; receive {filename: upload_mtime} for successful uploads
+        upload_mtimes = await self._upload_files(files_to_upload, folder_path)
+        uploaded_files = list(upload_mtimes.keys())
 
         # Step 5: Update backup info file with successfully uploaded files only
         if uploaded_files:
             # Create updated backup info with only successfully uploaded files
             updated_backup_info: Dict[str, Any] = existing_backup_info.copy()
 
-            # Add/update entries for successfully uploaded files; normalise to new dict format
+            # Add/update entries for successfully uploaded files with upload-captured mtime (D-02)
             for filename in uploaded_files:
                 entry = current_files.get(filename)
                 if entry is not None:
-                    updated_backup_info[filename] = (
-                        entry if isinstance(entry, dict) else {"md5": entry, "mtime": 0.0}
-                    )
+                    current_md5 = entry.get("md5") if isinstance(entry, dict) else entry
+                    updated_backup_info[filename] = {
+                        "md5": current_md5,
+                        "mtime": upload_mtimes[filename],
+                    }
 
             # Also include unchanged files that weren't uploaded (they're still valid)
             for filename, entry in current_files.items():
@@ -192,13 +195,9 @@ class FileListener:
             logger.warning(f"No files uploaded successfully in {folder_path}, backup info not updated")
         else:
             # No files needed upload, but update backup info to include any new unchanged files.
-            # Normalise current_files to new dict format before comparing/writing.
-            normalised_current: Dict[str, Any] = {
-                fname: (entry if isinstance(entry, dict) else {"md5": entry, "mtime": 0.0})
-                for fname, entry in current_files.items()
-            }
-            if normalised_current != existing_backup_info:
-                await self._update_backup_info(backup_info_file, normalised_current)
+            # current_files is already in new dict format (returned by _scan_current_files).
+            if current_files != existing_backup_info:
+                await self._update_backup_info(backup_info_file, current_files)
                 logger.info(f"Updated backup info for {folder_path} with unchanged files")
 
     async def _load_backup_info(self, backup_info_file: Path) -> Dict[str, Dict[str, Any]]:
@@ -240,20 +239,30 @@ class FileListener:
             self._backup_info_mtime[folder] = disk_mtime
             return data
 
-    async def _scan_current_files(self, folder_path: Path) -> Dict[str, str]:
-        """Scan current folder and compute MD5 for all files in parallel.
+    async def _scan_current_files(
+        self,
+        folder_path: Path,
+        existing_backup_info: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Scan current folder and compute MD5 for changed files; skip unchanged via mtime (PERF-01).
 
         Args:
             folder_path: Path to folder to scan
+            existing_backup_info: Previously stored backup info dict (from _load_backup_info).
+                When provided, files whose st_mtime matches the stored mtime are skipped —
+                MD5 is not recomputed. Pass None or {} to force full recomputation.
 
         Returns:
-            Dictionary mapping filename to MD5 hash
+            Dictionary mapping filename to {"md5": str, "mtime": float}
         """
-        current_files = {}
+        if existing_backup_info is None:
+            existing_backup_info = {}
+
+        current_files: Dict[str, Dict[str, Any]] = {}
 
         try:
-            # Collect all files to process
-            files_to_scan = []
+            # Collect all files to process; apply mtime-skip before scheduling MD5 tasks
+            files_to_hash: List[Path] = []
             for file_path in folder_path.iterdir():
                 if file_path.is_dir():
                     continue
@@ -261,27 +270,49 @@ class FileListener:
                 if IGNORE_RULES.should_ignore_file(file_path):
                     self._stats["ignored_files"] += 1
                     continue
-                files_to_scan.append(file_path)
 
-            if not files_to_scan:
+                # PERF-01: check st_mtime before scheduling MD5 computation
+                try:
+                    stat = file_path.stat()
+                except OSError:
+                    # Cannot stat — fall through to MD5 computation
+                    files_to_hash.append(file_path)
+                    continue
+
+                entry = existing_backup_info.get(file_path.name)
+                if entry and entry.get("mtime") == stat.st_mtime:
+                    # mtime unchanged → skip MD5, carry forward existing entry
+                    self._stats["skipped_files"] += 1
+                    current_files[file_path.name] = entry
+                    continue
+
+                files_to_hash.append(file_path)
+
+            if not files_to_hash:
                 return current_files
 
-            # Create tasks for parallel MD5 computation
+            # Create tasks for parallel MD5 computation on files that need it
             md5_tasks = []
-            for file_path in files_to_scan:
+            for file_path in files_to_hash:
                 task = asyncio.create_task(self._calculate_md5_with_semaphore(file_path))
-                md5_tasks.append((file_path.name, task))
+                md5_tasks.append((file_path, task))
 
-            logger.debug(f"Computing MD5 for {len(files_to_scan)} files in parallel (max 50 concurrent)")
+            logger.debug(f"Computing MD5 for {len(files_to_hash)} files in parallel (max 50 concurrent)")
 
             # Gather all MD5 tasks concurrently and validate the responses
             results = await asyncio.gather(*(task for _, task in md5_tasks), return_exceptions=True)
-            for (filename, _), result in zip(md5_tasks, results):
+            for (file_path, _), result in zip(md5_tasks, results):
                 if isinstance(result, Exception):
-                    logger.error(f"Error computing MD5 for {filename}: {result}")
+                    logger.error(f"Error computing MD5 for {file_path.name}: {result}")
                     self._stats["errors"] += 1
                 elif result:
-                    current_files[filename] = result
+                    # Store new dict format; mtime captured at scan time (D-02 note: upload
+                    # will re-capture mtime just before the upload call for uploaded files)
+                    try:
+                        scan_mtime = file_path.stat().st_mtime
+                    except OSError:
+                        scan_mtime = 0.0
+                    current_files[file_path.name] = {"md5": result, "mtime": scan_mtime}
                     self._stats["scanned_files"] += 1
                 else:
                     self._stats["errors"] += 1
@@ -325,15 +356,17 @@ class FileListener:
 
         return files_to_upload
 
-    async def _upload_single_file(self, filename: str, folder_path: Path) -> bool:
-        """Upload a single file with semaphore control.
+    async def _upload_single_file(self, filename: str, folder_path: Path) -> Tuple[bool, float]:
+        """Upload a single file with semaphore control, capturing st_mtime just before upload (D-02).
 
         Args:
             filename: Name of file to upload
             folder_path: Path to folder containing the files
 
         Returns:
-            True if successfully uploaded, False otherwise
+            Tuple of (success: bool, upload_mtime: float). upload_mtime is the st_mtime
+            captured immediately before the upload call, so a file modified during upload
+            is detected on the next scan cycle. Returns (False, 0.0) on any failure.
         """
         async with self.upload_semaphore:
             file_path = folder_path / filename
@@ -348,30 +381,42 @@ class FileListener:
                 if not local_md5:
                     logger.error(f"Failed to calculate MD5 for {file_path}")
                     self._stats["errors"] += 1
-                    return False
+                    return False, 0.0
 
                 # Check if file exists in S3 with same MD5
                 if await self.s3_manager.check_exists(s3_key, local_md5):
                     logger.info(f"File already exists in S3 with same MD5: {s3_key}")
                     self._stats["skipped_files"] += 1
-                    return True
+                    # Capture mtime for already-synced file so it can be recorded
+                    try:
+                        upload_mtime = file_path.stat().st_mtime
+                    except OSError:
+                        upload_mtime = 0.0
+                    return True, upload_mtime
+
+                # D-02: capture st_mtime just before upload so a file modified during upload
+                # is detected on the next cycle (we record what we actually uploaded).
+                try:
+                    upload_mtime = file_path.stat().st_mtime
+                except OSError:
+                    upload_mtime = 0.0
 
                 # Upload file
                 if await self.s3_manager.upload_file(file_path, s3_key):
                     self._stats["uploaded_files"] += 1
                     logger.info(f"Uploaded: {file_path} -> {s3_key}")
-                    return True
+                    return True, upload_mtime
                 else:
                     logger.error(f"Failed to upload: {file_path}")
                     self._stats["errors"] += 1
-                    return False
+                    return False, 0.0
 
             except Exception as e:
                 logger.error(f"Error uploading {file_path}: {e}")
                 self._stats["errors"] += 1
-                return False
+                return False, 0.0
 
-    async def _upload_with_timeout(self, filename: str, folder_path: Path) -> Tuple[str, bool]:
+    async def _upload_with_timeout(self, filename: str, folder_path: Path) -> Tuple[str, bool, float]:
         """Wrap a single upload in asyncio.wait_for so the 300s window belongs to the coroutine, not the task.
 
         ASYNC-02 Pitfall 1 fix: when wait_for was applied to an already-created task
@@ -384,21 +429,24 @@ class FileListener:
             folder_path: Folder containing the file
 
         Returns:
-            Tuple (filename, success_bool). Exceptions are caught and surfaced as (filename, False).
+            Tuple (filename, success_bool, upload_mtime). upload_mtime is the st_mtime
+            captured just before upload (D-02). On failure, upload_mtime is 0.0.
         """
         try:
-            result = await asyncio.wait_for(self._upload_single_file(filename, folder_path), timeout=300)
-            return filename, bool(result)
+            ok, upload_mtime = await asyncio.wait_for(
+                self._upload_single_file(filename, folder_path), timeout=300
+            )
+            return filename, bool(ok), upload_mtime
         except asyncio.TimeoutError:
             logger.error(f"Upload timeout for {filename} (5 minutes)")
             self._stats["errors"] += 1
-            return filename, False
+            return filename, False, 0.0
         except Exception as e:
             logger.error(f"Upload task failed for {filename}: {e}")
             self._stats["errors"] += 1
-            return filename, False
+            return filename, False, 0.0
 
-    async def _upload_files(self, files_to_upload: List[str], folder_path: Path) -> List[str]:
+    async def _upload_files(self, files_to_upload: List[str], folder_path: Path) -> Dict[str, float]:
         """Upload files to S3 concurrently using asyncio.gather.
 
         ASYNC-02 fix: replaces serial-wait_for-in-for-loop with a single gather call so all
@@ -410,10 +458,11 @@ class FileListener:
             folder_path: Folder containing the files
 
         Returns:
-            List of filenames that were successfully uploaded
+            Dict mapping successfully-uploaded filename to the upload_mtime captured just
+            before the upload call (D-02). Failed uploads are absent from the dict.
         """
         if not files_to_upload:
-            return []
+            return {}
 
         logger.info(
             f"Starting concurrent upload of {len(files_to_upload)} files "
@@ -434,15 +483,15 @@ class FileListener:
         # failure from cancelling the rest.
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        uploaded_files: List[str] = []
+        uploaded_files: Dict[str, float] = {}
         for result in results:
             if isinstance(result, Exception):
                 logger.error(f"Upload coroutine raised unexpectedly: {result}")
                 self._stats["errors"] += 1
                 continue
-            filename, ok = result
+            filename, ok, upload_mtime = result
             if ok:
-                uploaded_files.append(filename)
+                uploaded_files[filename] = upload_mtime
                 logger.debug(f"Successfully uploaded: {filename}")
             else:
                 logger.warning(f"Upload failed for: {filename}")
