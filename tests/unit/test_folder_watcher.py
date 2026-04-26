@@ -478,3 +478,91 @@ class TestFolderWatcherConfiguration:
             assert watcher.running is True
             assert len(watcher.handlers) == 0
             mock_observer_start.assert_called_once()
+
+
+class TestEventDebounce:
+    """PERF-04: 2-second per-path debounce on file system events."""
+
+    @pytest.fixture
+    def debounce_handler(self, test_config, temp_watch_folder):
+        """FileChangeHandler bound to the running asyncio loop with a mocked file_listener."""
+        from unittest.mock import AsyncMock
+        from aws_copier.core.folder_watcher import FileChangeHandler
+
+        file_listener = AsyncMock()
+        file_listener._process_current_folder = AsyncMock()
+        loop = asyncio.get_event_loop()
+        return FileChangeHandler(test_config, temp_watch_folder, file_listener, loop)
+
+    async def test_rapid_events_collapse_to_one_call(self, debounce_handler, temp_watch_folder):
+        """Three rapid _schedule_debounced calls for the same path must produce exactly one _process_current_folder call."""
+        file_path = temp_watch_folder / "f.txt"
+        file_path.write_text("x")
+        # Three rapid schedules
+        await debounce_handler._schedule_debounced(file_path, "modified")
+        await debounce_handler._schedule_debounced(file_path, "modified")
+        await debounce_handler._schedule_debounced(file_path, "modified")
+        # Wait for the (single remaining) task to fire
+        await asyncio.sleep(2.3)
+        debounce_handler.file_listener._process_current_folder.assert_called_once()
+
+    async def test_distinct_paths_debounce_independently(self, debounce_handler, temp_watch_folder):
+        """Two distinct paths each get their own debounce task; both fire after 2 seconds."""
+        file_a = temp_watch_folder / "a.txt"
+        file_b = temp_watch_folder / "b.txt"
+        file_a.write_text("a")
+        file_b.write_text("b")
+        await debounce_handler._schedule_debounced(file_a, "modified")
+        await debounce_handler._schedule_debounced(file_b, "modified")
+        # Two pending tasks expected
+        pending = [t for t in debounce_handler._debounce_tasks.values() if not t.done()]
+        assert len(pending) == 2
+        await asyncio.sleep(2.3)
+        assert debounce_handler.file_listener._process_current_folder.call_count == 2
+
+    async def test_new_event_cancels_previous(self, debounce_handler, temp_watch_folder):
+        """A second event for the same path cancels the first debounce task and creates a new one."""
+        file_path = temp_watch_folder / "f.txt"
+        file_path.write_text("x")
+        await debounce_handler._schedule_debounced(file_path, "modified")
+        first_task = debounce_handler._debounce_tasks[str(file_path)]
+        await debounce_handler._schedule_debounced(file_path, "modified")
+        # Allow the cancellation to actually fire
+        await asyncio.sleep(0.05)
+        assert first_task.cancelled() or first_task.done()
+        # And the dict now points at a different task
+        assert debounce_handler._debounce_tasks[str(file_path)] is not first_task
+
+    async def test_cancelled_error_silenced(self, debounce_handler, temp_watch_folder, caplog):
+        """CancelledError from a cancelled debounce task must not produce ERROR-level log entries."""
+        import logging
+
+        file_path = temp_watch_folder / "f.txt"
+        file_path.write_text("x")
+        with caplog.at_level(logging.ERROR, logger="aws_copier.core.folder_watcher"):
+            await debounce_handler._schedule_debounced(file_path, "modified")
+            # Cancel before the 2s sleep elapses
+            debounce_handler.cancel_all_pending()
+            await asyncio.sleep(0.05)
+        # No ERROR-level log should mention CancelledError
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert all("CancelledError" not in r.message for r in error_records)
+
+    async def test_on_any_event_schedules_debounced_wrapper(self, debounce_handler, temp_watch_folder):
+        """on_any_event must schedule _schedule_debounced (not _process_changed_file) via run_coroutine_threadsafe."""
+        from unittest.mock import patch, MagicMock
+        from watchdog.events import FileSystemEvent
+
+        file_path = temp_watch_folder / "f.txt"
+        file_path.write_text("x")
+        event = MagicMock(spec=FileSystemEvent)
+        event.is_directory = False
+        event.event_type = "modified"
+        event.src_path = str(file_path)
+        with patch("aws_copier.core.folder_watcher.asyncio.run_coroutine_threadsafe") as spy:
+            debounce_handler.on_any_event(event)
+            spy.assert_called_once()
+            coro_arg, _loop_arg = spy.call_args.args
+            # The scheduled coroutine must be _schedule_debounced, not _process_changed_file
+            assert coro_arg.cr_code.co_name == "_schedule_debounced"
+            coro_arg.close()  # avoid "coroutine was never awaited" warning
