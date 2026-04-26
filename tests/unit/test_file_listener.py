@@ -320,7 +320,7 @@ class TestFileListenerUploads:
             (temp_watch_folder / filename).write_text(f"content of {filename}")
 
         # Configure mock to simulate partial success
-        def mock_upload_side_effect(file_path, s3_key):
+        def mock_upload_side_effect(file_path, s3_key, **kwargs):
             filename = file_path.name
             return filename.startswith("success")  # Only "success*" files succeed
 
@@ -617,7 +617,7 @@ class TestFileListenerConcurrentUpload:
         """10 files with 0.2s artificial delay each must finish in well under 2s (serial) — around 0.3s."""
         import time
 
-        async def slow_upload(file_path, s3_key):
+        async def slow_upload(file_path, s3_key, **kwargs):
             await asyncio.sleep(0.2)
             return True
 
@@ -654,7 +654,7 @@ class TestFileListenerConcurrentUpload:
         """One raising coroutine must not cancel the rest; return_exceptions=True preserves partial success."""
         calls = {"n": 0}
 
-        async def maybe_fail(file_path, s3_key):
+        async def maybe_fail(file_path, s3_key, **kwargs):
             calls["n"] += 1
             if calls["n"] == 2:
                 raise RuntimeError("simulated failure")
@@ -864,7 +864,7 @@ class TestMtimeSkip:
         # Capture the pre-upload mtime from within the upload coroutine
         captured_mtimes: dict = {}
 
-        async def upload_and_record(file_path, s3_key):
+        async def upload_and_record(file_path, s3_key, **kwargs):
             # Record the mtime at the moment upload is called
             captured_mtimes[file_path.name] = file_path.stat().st_mtime
             return True
