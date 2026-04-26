@@ -38,6 +38,13 @@ class AWSCopierApp:
             await self.s3_manager.initialize()
             logger.info("✅ S3 Manager initialized")
 
+            # CONFIG-07: ensure AbortIncompleteMultipartUpload lifecycle rule exists.
+            # D-11: never raises; logs warning on failure and continues.
+            await self.s3_manager.ensure_lifecycle_rule()
+
+            # D-10: log credential source for audit trail (set by SimpleConfig per CONFIG-05).
+            logger.info(f"AWS credentials loaded from: {self.config.credential_source}")
+
             # ASYNC-06: install SIGTERM / SIGINT handlers now that the loop is running.
             self._setup_signal_handlers()
 
