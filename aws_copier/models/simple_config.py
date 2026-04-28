@@ -51,7 +51,7 @@ class SimpleConfig:
             self.folder_s3_mapping: Dict[Path, str] = {default_path: "Documents"}
 
         # Upload settings
-        self.max_concurrent_uploads: int = kwargs.get("max_concurrent_uploads", 100)
+        self.max_concurrent_uploads: int = kwargs.get("max_concurrent_uploads", 10)
 
         # Web dashboard settings
         self.web_port: int = int(kwargs.get("web_port", 8765))

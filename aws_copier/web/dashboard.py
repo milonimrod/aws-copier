@@ -148,9 +148,9 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
         const r = await fetch('/status');
         if (!r.ok) return;
         const d = await r.json();
-        document.getElementById('s-scan').textContent  = d.files_scanned  ?? d.scanned  ?? '-';
-        document.getElementById('s-up').textContent    = d.files_uploaded ?? d.uploaded ?? '-';
-        document.getElementById('s-skip').textContent  = d.files_skipped  ?? d.skipped  ?? '-';
+        document.getElementById('s-scan').textContent  = d.scanned_files  ?? '-';
+        document.getElementById('s-up').textContent    = d.uploaded_files ?? '-';
+        document.getElementById('s-skip').textContent  = d.skipped_files  ?? '-';
         document.getElementById('s-err').textContent   = d.errors ?? '-';
       } catch(e) {}
     }
