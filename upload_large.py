@@ -53,12 +53,15 @@ class LargeFileUploader:
         retries: int = 3,
         part_size: int = DEFAULT_PART_MB * 1024 * 1024,
         concurrency: int = DEFAULT_CONCURRENCY,
+        file_concurrency: int = 2,
     ):
         self.config = config
         self.retries = retries
         self.part_size = part_size
         self.concurrency = concurrency
-        # Bound concurrent MD5 reads to avoid disk thrash; 4 is plenty for large files
+        # Bound concurrent file uploads — each already uses `concurrency` parallel parts
+        self._upload_semaphore = asyncio.Semaphore(file_concurrency)
+        # Bound concurrent MD5 reads to avoid disk thrash
         self._md5_semaphore = asyncio.Semaphore(4)
         self._session = get_session()
         self._exit_stack = contextlib.AsyncExitStack()
@@ -99,10 +102,26 @@ class LargeFileUploader:
 
         return await loop.run_in_executor(None, _hash)
 
-    async def _compute_md5_bounded(self, path: Path) -> str:
-        """Compute MD5 with semaphore so at most 4 large files are read concurrently."""
+    async def _process_file(self, fp: Path, s3_key: str) -> bool:
+        """MD5 → upload pipeline for a single file.
+
+        MD5 computation and the S3 exists-check run immediately (bounded only by
+        _md5_semaphore). The actual upload waits for _upload_semaphore so at most
+        `file_concurrency` files upload simultaneously while their successors are
+        already hashing.
+        """
         async with self._md5_semaphore:
-            return await self._compute_md5(path)
+            md5 = await self._compute_md5(fp)
+
+        # Check existence before waiting for an upload slot — cheap and avoids
+        # holding the semaphore for a file we'd skip anyway.
+        full_key = self._full_key(s3_key)
+        if await self._exists_in_s3(full_key):
+            print(f"\nSkip : {fp.name} (already in S3)")
+            return True
+
+        async with self._upload_semaphore:
+            return await self.upload_file(fp, s3_key, md5=md5)
 
     async def _exists_in_s3(self, full_key: str) -> bool:
         client = await self._get_client()
@@ -289,7 +308,12 @@ class LargeFileUploader:
             raise
 
     async def upload_folder(self, folder: Path, s3_dest: Optional[str]) -> bool:
-        """Upload every regular file in *folder* sequentially.
+        """Upload every regular file in *folder*, pipelining MD5 and upload across files.
+
+        All files are processed concurrently via asyncio.gather. For each file the
+        pipeline is: hash (bounded by _md5_semaphore) → exists-check → upload (bounded
+        by _upload_semaphore). This keeps the disk and network busy simultaneously —
+        while file N uploads, file N+1 is already being hashed.
 
         Returns:
             True if all files succeeded.
@@ -302,22 +326,18 @@ class LargeFileUploader:
         total_size = sum(p.stat().st_size for p in files)
         print(f"Found {len(files)} file(s) — total {_format_bytes(total_size)}")
 
-        # Pre-compute all MD5s concurrently (bounded to 4 at a time to avoid disk thrash)
-        print(f"Pre-computing MD5 hashes for {len(files)} file(s)...")
-        md5s: List[str] = await asyncio.gather(*[self._compute_md5_bounded(fp) for fp in files])
-        print("MD5 hashes ready.\n")
-
         start = time.monotonic()
-        failed: List[Path] = []
 
-        for fp, md5 in zip(files, md5s):
-            # Preserve subdirectory structure relative to the root folder
+        def _s3_key(fp: Path) -> str:
             relative = "/".join(fp.relative_to(folder).parts)
-            s3_key = f"{s3_dest.rstrip('/')}/{relative}" if s3_dest else relative
-            ok = await self.upload_file(fp, s3_key, md5=md5)
-            if not ok:
-                failed.append(fp)
+            return f"{s3_dest.rstrip('/')}/{relative}" if s3_dest else relative
 
+        results: List[bool] = await asyncio.gather(
+            *[self._process_file(fp, _s3_key(fp)) for fp in files],
+            return_exceptions=False,
+        )
+
+        failed = [fp for fp, ok in zip(files, results) if not ok]
         elapsed = time.monotonic() - start
         print(f"\n{'─' * 60}")
         print(f"Done: {len(files) - len(failed)}/{len(files)} succeeded in {elapsed:.0f}s")
@@ -368,6 +388,12 @@ Examples:
         default=DEFAULT_CONCURRENCY,
         help=f"Parallel part uploads per file (default: {DEFAULT_CONCURRENCY})",
     )
+    parser.add_argument(
+        "--file-concurrency",
+        type=int,
+        default=2,
+        help="Number of files uploading simultaneously (default: 2)",
+    )
     parser.add_argument("--verbose", action="store_true", help="Show debug logging")
     return parser.parse_args()
 
@@ -398,13 +424,16 @@ def main() -> None:
     print(f"Region      : {config.aws_region}")
     if config.s3_prefix:
         print(f"Prefix      : {config.s3_prefix}")
-    print(f"Part size   : {part_mb} MB  |  Concurrency: {args.concurrency}  |  Retries: {args.retries}")
+    print(
+        f"Part size   : {part_mb} MB  |  Part concurrency: {args.concurrency}  |  File concurrency: {args.file_concurrency}  |  Retries: {args.retries}"
+    )
 
     uploader = LargeFileUploader(
         config,
         retries=args.retries,
         part_size=part_mb * 1024 * 1024,
         concurrency=args.concurrency,
+        file_concurrency=args.file_concurrency,
     )
 
     async def run() -> bool:
