@@ -3,6 +3,7 @@
 import hashlib
 import tempfile
 from pathlib import Path
+from typing import Optional
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -247,7 +248,60 @@ async def test_upload_file_aborts_multipart_on_failure(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# upload_folder — summary reporting
+# _process_file — pipeline: MD5 → exists-check → upload
+# ---------------------------------------------------------------------------
+
+
+async def test_process_file_hashes_then_uploads(tmp_path):
+    fp = tmp_path / "data.bin"
+    fp.write_bytes(b"x" * 100)
+
+    uploader = _make_uploader()
+    order: list = []
+
+    async def _fake_md5(path: Path) -> str:
+        order.append("md5")
+        return "deadbeef"
+
+    async def _fake_exists(key: str) -> bool:
+        order.append("exists")
+        return False
+
+    async def _fake_upload(path: Path, key: str, md5: Optional[str] = None) -> bool:
+        order.append("upload")
+        assert md5 == "deadbeef"
+        return True
+
+    with (
+        patch.object(uploader, "_compute_md5", side_effect=_fake_md5),
+        patch.object(uploader, "_exists_in_s3", side_effect=_fake_exists),
+        patch.object(uploader, "upload_file", side_effect=_fake_upload),
+    ):
+        ok = await uploader._process_file(fp, "data.bin")
+
+    assert ok is True
+    assert order == ["md5", "exists", "upload"]
+
+
+async def test_process_file_skips_upload_when_exists(tmp_path, capsys):
+    fp = tmp_path / "data.bin"
+    fp.write_bytes(b"x" * 100)
+
+    uploader = _make_uploader()
+
+    with (
+        patch.object(uploader, "_compute_md5", new_callable=AsyncMock, return_value="abc"),
+        patch.object(uploader, "_exists_in_s3", new_callable=AsyncMock, return_value=True),
+        patch.object(uploader, "upload_file", new_callable=AsyncMock) as mock_upload,
+    ):
+        ok = await uploader._process_file(fp, "data.bin")
+
+    assert ok is True
+    mock_upload.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# upload_folder — dispatching and S3 key construction
 # ---------------------------------------------------------------------------
 
 
@@ -256,7 +310,7 @@ async def test_upload_folder_all_success(tmp_path):
     (tmp_path / "b.bin").write_bytes(b"y" * 200)
 
     uploader = _make_uploader()
-    with patch.object(uploader, "upload_file", new_callable=AsyncMock, return_value=True):
+    with patch.object(uploader, "_process_file", new_callable=AsyncMock, return_value=True):
         ok = await uploader.upload_folder(tmp_path, None)
 
     assert ok is True
@@ -269,10 +323,10 @@ async def test_upload_folder_partial_failure(tmp_path):
     uploader = _make_uploader()
     results = {"ok.bin": True, "bad.bin": False}
 
-    async def _fake_upload(path: Path, key: str) -> bool:
+    async def _fake_process(path: Path, key: str) -> bool:
         return results[path.name]
 
-    with patch.object(uploader, "upload_file", side_effect=_fake_upload):
+    with patch.object(uploader, "_process_file", side_effect=_fake_process):
         ok = await uploader.upload_folder(tmp_path, None)
 
     assert ok is False
@@ -291,11 +345,11 @@ async def test_upload_folder_uses_s3_dest_prefix(tmp_path):
     uploader = _make_uploader()
     captured_keys: list = []
 
-    async def _fake_upload(path: Path, key: str) -> bool:
+    async def _fake_process(path: Path, key: str) -> bool:
         captured_keys.append(key)
         return True
 
-    with patch.object(uploader, "upload_file", side_effect=_fake_upload):
+    with patch.object(uploader, "_process_file", side_effect=_fake_process):
         await uploader.upload_folder(tmp_path, "archive/2026")
 
     assert captured_keys == ["archive/2026/file.bin"]
@@ -313,11 +367,11 @@ async def test_upload_folder_recurses_subdirectories(tmp_path):
     uploader = _make_uploader()
     captured_keys: list = []
 
-    async def _fake_upload(path: Path, key: str) -> bool:
+    async def _fake_process(path: Path, key: str) -> bool:
         captured_keys.append(key)
         return True
 
-    with patch.object(uploader, "upload_file", side_effect=_fake_upload):
+    with patch.object(uploader, "_process_file", side_effect=_fake_process):
         ok = await uploader.upload_folder(tmp_path, None)
 
     assert ok is True
@@ -332,11 +386,11 @@ async def test_upload_folder_recurse_preserves_prefix(tmp_path):
     uploader = _make_uploader()
     captured_keys: list = []
 
-    async def _fake_upload(path: Path, key: str) -> bool:
+    async def _fake_process(path: Path, key: str) -> bool:
         captured_keys.append(key)
         return True
 
-    with patch.object(uploader, "upload_file", side_effect=_fake_upload):
+    with patch.object(uploader, "_process_file", side_effect=_fake_process):
         await uploader.upload_folder(tmp_path, "backup")
 
     assert captured_keys == ["backup/photos/2026/img.jpg"]
