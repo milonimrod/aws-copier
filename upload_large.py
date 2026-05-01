@@ -58,6 +58,8 @@ class LargeFileUploader:
         self.retries = retries
         self.part_size = part_size
         self.concurrency = concurrency
+        # Bound concurrent MD5 reads to avoid disk thrash; 4 is plenty for large files
+        self._md5_semaphore = asyncio.Semaphore(4)
         self._session = get_session()
         self._exit_stack = contextlib.AsyncExitStack()
         self._client = None
@@ -96,6 +98,11 @@ class LargeFileUploader:
             return h.hexdigest()
 
         return await loop.run_in_executor(None, _hash)
+
+    async def _compute_md5_bounded(self, path: Path) -> str:
+        """Compute MD5 with semaphore so at most 4 large files are read concurrently."""
+        async with self._md5_semaphore:
+            return await self._compute_md5(path)
 
     async def _exists_in_s3(self, full_key: str) -> bool:
         client = await self._get_client()
@@ -147,8 +154,13 @@ class LargeFileUploader:
                 await asyncio.sleep(wait)
         raise RuntimeError(f"Part {part_number} exhausted all retries")  # unreachable
 
-    async def upload_file(self, local_path: Path, s3_key: str) -> bool:
+    async def upload_file(self, local_path: Path, s3_key: str, md5: Optional[str] = None) -> bool:
         """Upload one file using concurrent multipart upload, retrying the full sequence on error.
+
+        Args:
+            local_path: Local file to upload.
+            s3_key: Destination S3 key (relative to config prefix).
+            md5: Pre-computed MD5 hex string. When None, computed on the fly.
 
         Returns:
             True on success, False after exhausting retries.
@@ -163,9 +175,12 @@ class LargeFileUploader:
             print("Skip : already exists in S3")
             return True
 
-        print("MD5  : computing...", end=" ", flush=True)
-        md5 = await self._compute_md5(local_path)
-        print(md5)
+        if md5 is None:
+            print("MD5  : computing...", end=" ", flush=True)
+            md5 = await self._compute_md5(local_path)
+            print(md5)
+        else:
+            print(f"MD5  : {md5} (pre-computed)")
 
         file_size = local_path.stat().st_size
         total_parts = max(1, (file_size + self.part_size - 1) // self.part_size)
@@ -287,14 +302,19 @@ class LargeFileUploader:
         total_size = sum(p.stat().st_size for p in files)
         print(f"Found {len(files)} file(s) — total {_format_bytes(total_size)}")
 
+        # Pre-compute all MD5s concurrently (bounded to 4 at a time to avoid disk thrash)
+        print(f"Pre-computing MD5 hashes for {len(files)} file(s)...")
+        md5s: List[str] = await asyncio.gather(*[self._compute_md5_bounded(fp) for fp in files])
+        print("MD5 hashes ready.\n")
+
         start = time.monotonic()
         failed: List[Path] = []
 
-        for fp in files:
+        for fp, md5 in zip(files, md5s):
             # Preserve subdirectory structure relative to the root folder
             relative = "/".join(fp.relative_to(folder).parts)
             s3_key = f"{s3_dest.rstrip('/')}/{relative}" if s3_dest else relative
-            ok = await self.upload_file(fp, s3_key)
+            ok = await self.upload_file(fp, s3_key, md5=md5)
             if not ok:
                 failed.append(fp)
 
