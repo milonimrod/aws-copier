@@ -299,3 +299,44 @@ async def test_upload_folder_uses_s3_dest_prefix(tmp_path):
         await uploader.upload_folder(tmp_path, "archive/2026")
 
     assert captured_keys == ["archive/2026/file.bin"]
+
+
+async def test_upload_folder_recurses_subdirectories(tmp_path):
+    (tmp_path / "root.bin").write_bytes(b"r")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "deep.bin").write_bytes(b"d")
+    nested = sub / "nested"
+    nested.mkdir()
+    (nested / "bottom.bin").write_bytes(b"b")
+
+    uploader = _make_uploader()
+    captured_keys: list = []
+
+    async def _fake_upload(path: Path, key: str) -> bool:
+        captured_keys.append(key)
+        return True
+
+    with patch.object(uploader, "upload_file", side_effect=_fake_upload):
+        ok = await uploader.upload_folder(tmp_path, None)
+
+    assert ok is True
+    assert sorted(captured_keys) == ["root.bin", "sub/deep.bin", "sub/nested/bottom.bin"]
+
+
+async def test_upload_folder_recurse_preserves_prefix(tmp_path):
+    sub = tmp_path / "photos" / "2026"
+    sub.mkdir(parents=True)
+    (sub / "img.jpg").write_bytes(b"img")
+
+    uploader = _make_uploader()
+    captured_keys: list = []
+
+    async def _fake_upload(path: Path, key: str) -> bool:
+        captured_keys.append(key)
+        return True
+
+    with patch.object(uploader, "upload_file", side_effect=_fake_upload):
+        await uploader.upload_folder(tmp_path, "backup")
+
+    assert captured_keys == ["backup/photos/2026/img.jpg"]
