@@ -3,6 +3,7 @@
 import hashlib
 import tempfile
 from pathlib import Path
+from typing import Optional
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -256,7 +257,10 @@ async def test_upload_folder_all_success(tmp_path):
     (tmp_path / "b.bin").write_bytes(b"y" * 200)
 
     uploader = _make_uploader()
-    with patch.object(uploader, "upload_file", new_callable=AsyncMock, return_value=True):
+    with (
+        patch.object(uploader, "_compute_md5_bounded", new_callable=AsyncMock, return_value="abc123"),
+        patch.object(uploader, "upload_file", new_callable=AsyncMock, return_value=True),
+    ):
         ok = await uploader.upload_folder(tmp_path, None)
 
     assert ok is True
@@ -269,10 +273,13 @@ async def test_upload_folder_partial_failure(tmp_path):
     uploader = _make_uploader()
     results = {"ok.bin": True, "bad.bin": False}
 
-    async def _fake_upload(path: Path, key: str) -> bool:
+    async def _fake_upload(path: Path, key: str, md5: Optional[str] = None) -> bool:
         return results[path.name]
 
-    with patch.object(uploader, "upload_file", side_effect=_fake_upload):
+    with (
+        patch.object(uploader, "_compute_md5_bounded", new_callable=AsyncMock, return_value="abc123"),
+        patch.object(uploader, "upload_file", side_effect=_fake_upload),
+    ):
         ok = await uploader.upload_folder(tmp_path, None)
 
     assert ok is False
@@ -291,14 +298,37 @@ async def test_upload_folder_uses_s3_dest_prefix(tmp_path):
     uploader = _make_uploader()
     captured_keys: list = []
 
-    async def _fake_upload(path: Path, key: str) -> bool:
+    async def _fake_upload(path: Path, key: str, md5: Optional[str] = None) -> bool:
         captured_keys.append(key)
         return True
 
-    with patch.object(uploader, "upload_file", side_effect=_fake_upload):
+    with (
+        patch.object(uploader, "_compute_md5_bounded", new_callable=AsyncMock, return_value="abc123"),
+        patch.object(uploader, "upload_file", side_effect=_fake_upload),
+    ):
         await uploader.upload_folder(tmp_path, "archive/2026")
 
     assert captured_keys == ["archive/2026/file.bin"]
+
+
+async def test_upload_folder_md5_passed_to_upload(tmp_path):
+    """upload_folder pre-computes MD5 and passes it to upload_file."""
+    (tmp_path / "file.bin").write_bytes(b"data")
+
+    uploader = _make_uploader()
+    received_md5s: list = []
+
+    async def _fake_upload(path: Path, key: str, md5: Optional[str] = None) -> bool:
+        received_md5s.append(md5)
+        return True
+
+    with (
+        patch.object(uploader, "_compute_md5_bounded", new_callable=AsyncMock, return_value="deadbeef"),
+        patch.object(uploader, "upload_file", side_effect=_fake_upload),
+    ):
+        await uploader.upload_folder(tmp_path, None)
+
+    assert received_md5s == ["deadbeef"]
 
 
 async def test_upload_folder_recurses_subdirectories(tmp_path):
@@ -313,11 +343,14 @@ async def test_upload_folder_recurses_subdirectories(tmp_path):
     uploader = _make_uploader()
     captured_keys: list = []
 
-    async def _fake_upload(path: Path, key: str) -> bool:
+    async def _fake_upload(path: Path, key: str, md5: Optional[str] = None) -> bool:
         captured_keys.append(key)
         return True
 
-    with patch.object(uploader, "upload_file", side_effect=_fake_upload):
+    with (
+        patch.object(uploader, "_compute_md5_bounded", new_callable=AsyncMock, return_value="abc123"),
+        patch.object(uploader, "upload_file", side_effect=_fake_upload),
+    ):
         ok = await uploader.upload_folder(tmp_path, None)
 
     assert ok is True
@@ -332,11 +365,14 @@ async def test_upload_folder_recurse_preserves_prefix(tmp_path):
     uploader = _make_uploader()
     captured_keys: list = []
 
-    async def _fake_upload(path: Path, key: str) -> bool:
+    async def _fake_upload(path: Path, key: str, md5: Optional[str] = None) -> bool:
         captured_keys.append(key)
         return True
 
-    with patch.object(uploader, "upload_file", side_effect=_fake_upload):
+    with (
+        patch.object(uploader, "_compute_md5_bounded", new_callable=AsyncMock, return_value="abc123"),
+        patch.object(uploader, "upload_file", side_effect=_fake_upload),
+    ):
         await uploader.upload_folder(tmp_path, "backup")
 
     assert captured_keys == ["backup/photos/2026/img.jpg"]
