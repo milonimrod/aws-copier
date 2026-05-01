@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import random
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -34,7 +35,7 @@ class FileListener:
         self.s3_manager = s3_manager
         self.backup_info_filename = ".milo_backup.info"
 
-        # CONFIG-01: Semaphore wired to user-configured max_concurrent_uploads (default 100).
+        # CONFIG-01: Semaphore wired to user-configured max_concurrent_uploads (default 10).
         self.upload_semaphore = asyncio.Semaphore(self.config.max_concurrent_uploads)
 
         # Separate semaphore for MD5 computation to avoid blocking uploads.
@@ -188,11 +189,15 @@ class FileListener:
             # Step 1: Process current folder
             await self._process_current_folder(folder_path)
 
-            # Step 2: Process all subfolders recursively
+            # Step 2: Process all subfolders recursively in random order so each run
+            # covers a different slice of the tree first, preventing starvation of deep dirs.
             try:
-                for item in folder_path.iterdir():
-                    if item.is_dir() and not IGNORE_RULES.should_ignore_dir(item):
-                        await self._process_folder_recursively(item)
+                subdirs = [
+                    item for item in folder_path.iterdir() if item.is_dir() and not IGNORE_RULES.should_ignore_dir(item)
+                ]
+                random.shuffle(subdirs)
+                for item in subdirs:
+                    await self._process_folder_recursively(item)
             except PermissionError:
                 logger.warning(f"Permission denied accessing folder: {folder_path}")
             except Exception as e:
