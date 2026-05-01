@@ -31,6 +31,7 @@ ui = [
 
 [project.scripts]
 aws-copier = "main:sync_main"
+upload-large = "upload_large:main"
 
 [build-system]
 requires = ["hatchling"]
