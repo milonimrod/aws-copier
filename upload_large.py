@@ -279,7 +279,7 @@ class LargeFileUploader:
         Returns:
             True if all files succeeded.
         """
-        files = sorted(p for p in folder.iterdir() if p.is_file())
+        files = sorted(p for p in folder.rglob("*") if p.is_file())
         if not files:
             print(f"No files found in {folder}")
             return True
@@ -291,7 +291,9 @@ class LargeFileUploader:
         failed: List[Path] = []
 
         for fp in files:
-            s3_key = f"{s3_dest.rstrip('/')}/{fp.name}" if s3_dest else fp.name
+            # Preserve subdirectory structure relative to the root folder
+            relative = "/".join(fp.relative_to(folder).parts)
+            s3_key = f"{s3_dest.rstrip('/')}/{relative}" if s3_dest else relative
             ok = await self.upload_file(fp, s3_key)
             if not ok:
                 failed.append(fp)
