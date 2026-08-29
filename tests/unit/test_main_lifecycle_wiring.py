@@ -1,6 +1,7 @@
 """Tests for main.py AWSCopierApp.start() wiring of CONFIG-07 lifecycle rule and D-10 credential source log."""
 
 import logging
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -172,3 +173,38 @@ class TestStartupWiring:
         s3.ensure_lifecycle_rule.return_value = None
         # Must complete without raising
         await app.start()
+
+
+class TestConfigPathWiring:
+    """Regression tests: AWSCopierApp must load the same config.yaml that main() gate-checks.
+
+    Previously AWSCopierApp.__init__ called load_config() with no argument, which defaults
+    to DEFAULT_CONFIG_PATH (~/aws-copier-config.yaml) — silently ignoring the local
+    config.yaml that main() had just verified exists. This broke in any environment without
+    a pre-existing ~/aws-copier-config.yaml (e.g. a Docker container with no home directory).
+    """
+
+    def test_default_config_path_is_local_config_yaml(self):
+        """With no argument, AWSCopierApp loads config.yaml from the working directory."""
+        cfg = _make_test_config(use_chain=False)
+        with (
+            patch.object(main_module, "load_config", return_value=cfg) as mock_load_config,
+            patch.object(main_module, "S3Manager"),
+            patch.object(main_module, "FileListener"),
+            patch.object(main_module, "FolderWatcher"),
+        ):
+            AWSCopierApp()
+            mock_load_config.assert_called_once_with(Path("config.yaml"))
+
+    def test_explicit_config_path_is_passed_through(self):
+        """A caller-supplied config_path is forwarded to load_config unchanged."""
+        cfg = _make_test_config(use_chain=False)
+        custom_path = Path("/tmp/aws-copier-test/custom-config.yaml")
+        with (
+            patch.object(main_module, "load_config", return_value=cfg) as mock_load_config,
+            patch.object(main_module, "S3Manager"),
+            patch.object(main_module, "FileListener"),
+            patch.object(main_module, "FolderWatcher"),
+        ):
+            AWSCopierApp(config_path=custom_path)
+            mock_load_config.assert_called_once_with(custom_path)

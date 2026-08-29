@@ -1,0 +1,27 @@
+services:
+  aws-copier:
+    build: .
+    container_name: aws-copier
+    restart: unless-stopped
+    environment:
+      # UID/GID the daemon runs as inside the container — match the owner of your NAS
+      # shares so uploaded-file bookkeeping (.milo_backup.info) isn't written as root.
+      # On UGreen NAS, check an existing share's owner with `ls -n /volumeX/your-share`.
+      - PUID=1000
+      - PGID=1000
+      - TZ=UTC
+    volumes:
+      # Credentials + watch_folders/S3 settings — see config.yaml. Read-only: the daemon
+      # never needs to write to this file.
+      - ./config.yaml:/app/config.yaml:ro
+
+      # One line per folder you want backed up. The container path (right of the colon)
+      # must match a key under `watch_folders` in config.yaml. Replace the host paths
+      # (left of the colon) with real paths on your UGreen NAS, e.g. /volume1/Documents.
+      - /path/to/nas/documents:/data/documents
+      - /path/to/nas/pictures:/data/pictures
+
+    ports:
+      # Live log/status dashboard (aws_copier/web/dashboard.py). Drop this mapping, or set
+      # web_enabled: false in config.yaml, if you don't want it reachable from the LAN.
+      - "8765:8765"

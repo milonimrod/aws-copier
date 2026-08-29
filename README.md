@@ -11,14 +11,35 @@ A cross-platform daemon for real-time folder synchronization to AWS S3 with file
 - **Cross-platform**: Works on Windows, macOS, and Linux
 - **Crash Recovery**: Persistent state tracking survives application restarts
 
-## Quick Start
+## Running on Docker (e.g. a UGreen NAS)
+
+The daemon is designed to run headless in a container, which is the recommended way to run
+it on a NAS.
+
+1. Copy `config.yaml.example` to `config.yaml` (gitignored — it will hold real credentials)
+   and fill in your AWS credentials, S3 bucket, and `watch_folders`. The keys under
+   `watch_folders` are **container** paths (e.g. `/data/documents`), not host paths.
+2. Edit `docker-compose.yml`: replace the placeholder host paths on the left of each `:` in
+   `volumes` with the real paths of the NAS shares you want backed up, matching the
+   container paths (right of the `:`) you used in `config.yaml`. Set `PUID`/`PGID` to match
+   the owner of those shares (`ls -n /volumeX/your-share` on the NAS shows the numeric IDs).
+3. Build and start:
+   ```bash
+   docker compose up -d --build
+   ```
+4. Watch logs with `docker compose logs -f`, or open `http://<nas-ip>:8765` for the live
+   dashboard (disable by removing the `ports` mapping or setting `web_enabled: false`).
+
+Restart policy is `unless-stopped`, so the daemon comes back up after a NAS reboot.
+
+## Quick Start (local / dev, without Docker)
 
 1. Install dependencies:
    ```bash
    uv sync
    ```
 
-2. Configure your AWS credentials in `config.yaml`:
+2. Copy `config.yaml.example` to `config.yaml` and configure your AWS credentials:
    ```yaml
    aws_access_key_id: "your-access-key-id"
    aws_secret_access_key: "your-secret-access-key"

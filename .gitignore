@@ -12,5 +12,8 @@ wheels/
 **/.env
 *.env
 
+# Local config with real AWS credentials (see config.yaml.example)
+config.yaml
+
 # Virtual environments
 .venv

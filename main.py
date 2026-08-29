@@ -43,9 +43,15 @@ def _disable_quickedit_windows() -> None:
 class AWSCopierApp:
     """Main AWS Copier application using simplified architecture."""
 
-    def __init__(self):
-        """Initialize application."""
-        self.config = load_config()
+    def __init__(self, config_path: Path = Path("config.yaml")):
+        """Initialize application.
+
+        Args:
+            config_path: Path to the YAML config file. `main()` already verifies this
+                path exists before constructing AWSCopierApp, so load_config() here
+                loads it directly rather than falling back to DEFAULT_CONFIG_PATH.
+        """
+        self.config = load_config(config_path)
         self.s3_manager = S3Manager(self.config)
         # Incremental backup components
         self.file_listener = FileListener(self.config, self.s3_manager)

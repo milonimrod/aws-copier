@@ -14,7 +14,8 @@ def test_simple_config_creation():
 
     assert config.aws_region == "us-east-1"
     assert config.s3_bucket == "your-bucket-name"
-    assert config.max_concurrent_uploads == 100
+    # Default lowered 100 -> 10 (see #9) to avoid S3 rate limit errors.
+    assert config.max_concurrent_uploads == 10
     assert len(config.watch_folders) == 1
 
 
