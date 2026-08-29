@@ -64,6 +64,7 @@ class FileListener:
             "scanned_files": 0,
             "ignored_files": 0,
             "uploaded_files": 0,
+            "moved_files": 0,
             "skipped_files": 0,
             "errors": 0,
         }
@@ -82,19 +83,29 @@ class FileListener:
         return self._folder_locks[folder_path]
 
     def _migrate_entry(self, value: Any) -> Dict[str, Any]:
-        """Migrate old string backup-info entry to new {md5, mtime} dict format.
+        """Migrate old backup-info entry formats to the current {md5, mtime, s3_key} shape.
 
-        D-01: Old entries (str MD5) are read as {md5: value, mtime: 0.0}. mtime=0.0
-        guarantees the next scan re-stats and writes the new format on first hit.
+        D-01: Old string-only entries (bare MD5) are read as {md5: value, mtime: 0.0,
+        s3_key: None}. mtime=0.0 guarantees the next scan re-stats and writes the new
+        format on first hit.
+
+        MOVE-01: Entries from before the s3_key field existed are missing that key
+        entirely; they're backfilled with s3_key=None. None is a deliberate "unknown"
+        marker (not the folder-rename-detection sentinel) — _determine_files_to_upload
+        treats it as "trust this entry", so a pre-existing correctly-synced file isn't
+        forced through a spurious move on first scan after upgrade. Only a *known* stale
+        s3_key (recorded before a subsequent rename) triggers move detection.
 
         Args:
-            value: Raw entry from .milo_backup.info (str for old format, dict for new)
+            value: Raw entry from .milo_backup.info (str, or dict missing/containing s3_key)
 
         Returns:
-            Dict with keys 'md5' (str) and 'mtime' (float)
+            Dict with keys 'md5' (str), 'mtime' (float), and 's3_key' (str or None)
         """
         if isinstance(value, str):
-            return {"md5": value, "mtime": 0.0}
+            return {"md5": value, "mtime": 0.0, "s3_key": None}
+        if "s3_key" not in value:
+            return {**value, "s3_key": None}
         return value
 
     def _resolve_watch_root(self, folder_path: Path) -> Path:
@@ -222,16 +233,22 @@ class FileListener:
         watch_root = self._resolve_watch_root(folder_path)
         current_files = await self._scan_current_files(folder_path, existing_backup_info, watch_root)
 
-        # Step 3: Compare with existing backup info
-        files_to_upload = self._determine_files_to_upload(current_files, existing_backup_info)
+        # Step 3: Compare with existing backup info — MOVE-01 splits changed content
+        # (files_to_upload) from unchanged content at a stale S3 key (files_to_move).
+        files_to_upload, files_to_move = self._determine_files_to_upload(
+            current_files, existing_backup_info, folder_path
+        )
 
         # Step 4: Upload changed/new files; receive {filename: upload_mtime} for successful uploads
         upload_mtimes = await self._upload_files(files_to_upload, folder_path)
         uploaded_files = list(upload_mtimes.keys())
 
-        # Step 5: Update backup info file with successfully uploaded files only
-        if uploaded_files:
-            # Create updated backup info with only successfully uploaded files
+        # Step 4b (MOVE-01): reconcile renamed/moved files via server-side S3 copy
+        moved_files = await self._move_files(files_to_move, existing_backup_info, folder_path)
+
+        # Step 5: Update backup info file with successfully uploaded/moved files
+        if uploaded_files or moved_files:
+            # Create updated backup info with only successfully uploaded/moved files
             updated_backup_info: Dict[str, Any] = existing_backup_info.copy()
 
             # Add/update entries for successfully uploaded files with upload-captured mtime (D-02)
@@ -242,25 +259,58 @@ class FileListener:
                     updated_backup_info[filename] = {
                         "md5": current_md5,
                         "mtime": upload_mtimes[filename],
+                        "s3_key": self._build_s3_key(folder_path / filename),
                     }
 
-            # Also include unchanged files that weren't uploaded (they're still valid)
+            # MOVE-01: record the new (current) s3_key for successfully moved files — content
+            # and mtime are unchanged, only the S3 location was reconciled.
+            for filename in moved_files:
+                entry = current_files.get(filename)
+                if entry is not None:
+                    updated_backup_info[filename] = {
+                        "md5": entry.get("md5") if isinstance(entry, dict) else entry,
+                        "mtime": entry.get("mtime") if isinstance(entry, dict) else 0.0,
+                        "s3_key": self._build_s3_key(folder_path / filename),
+                    }
+
+            # Also include unchanged files that weren't uploaded or moved (still valid) —
+            # backfill s3_key so legacy/untracked entries pick it up going forward.
+            handled = set(uploaded_files) | set(moved_files)
             for filename, entry in current_files.items():
-                if filename not in files_to_upload:  # File wasn't changed, keep existing info
-                    updated_backup_info[filename] = entry if isinstance(entry, dict) else {"md5": entry, "mtime": 0.0}
+                if filename in files_to_upload or filename in files_to_move:
+                    continue  # covered above (or failed — leave existing_backup_info's copy)
+                if filename in handled:
+                    continue
+                current_md5 = entry.get("md5") if isinstance(entry, dict) else entry
+                current_mtime = entry.get("mtime") if isinstance(entry, dict) else 0.0
+                updated_backup_info[filename] = {
+                    "md5": current_md5,
+                    "mtime": current_mtime,
+                    "s3_key": self._build_s3_key(folder_path / filename),
+                }
 
             await self._update_backup_info(backup_info_file, updated_backup_info)
             logger.info(
-                f"Updated backup info for {folder_path}: {len(uploaded_files)} uploaded, {len(files_to_upload) - len(uploaded_files)} failed"
+                f"Updated backup info for {folder_path}: {len(uploaded_files)} uploaded, "
+                f"{len(moved_files)} moved, {len(files_to_upload) - len(uploaded_files)} upload-failed, "
+                f"{len(files_to_move) - len(moved_files)} move-failed"
             )
-        elif files_to_upload:
-            # Some files needed upload but none succeeded
-            logger.warning(f"No files uploaded successfully in {folder_path}, backup info not updated")
+        elif files_to_upload or files_to_move:
+            # Some files needed upload/move but none succeeded
+            logger.warning(f"No files uploaded or moved successfully in {folder_path}, backup info not updated")
         else:
-            # No files needed upload, but update backup info to include any new unchanged files.
-            # current_files is already in new dict format (returned by _scan_current_files).
-            if current_files != existing_backup_info:
-                await self._update_backup_info(backup_info_file, current_files)
+            # No files needed upload or move, but update backup info to include any new
+            # unchanged files and backfill s3_key on legacy entries.
+            backfilled: Dict[str, Any] = {
+                filename: {
+                    "md5": entry.get("md5") if isinstance(entry, dict) else entry,
+                    "mtime": entry.get("mtime") if isinstance(entry, dict) else 0.0,
+                    "s3_key": self._build_s3_key(folder_path / filename),
+                }
+                for filename, entry in current_files.items()
+            }
+            if backfilled != existing_backup_info:
+                await self._update_backup_info(backup_info_file, backfilled)
                 logger.info(f"Updated backup info for {folder_path} with unchanged files")
 
     async def _load_backup_info(self, backup_info_file: Path) -> Dict[str, Dict[str, Any]]:
@@ -408,21 +458,33 @@ class FileListener:
         return current_files
 
     def _determine_files_to_upload(
-        self, current_files: Dict[str, Any], existing_backup_info: Dict[str, Any]
-    ) -> List[str]:
-        """Determine which files need to be uploaded.
+        self, current_files: Dict[str, Any], existing_backup_info: Dict[str, Any], folder_path: Path
+    ) -> Tuple[List[str], List[str]]:
+        """Determine which files need uploading, and which merely need an S3-side move.
 
-        Handles both the legacy string format and the new {md5, mtime} dict format
-        in existing_backup_info — extracts the md5 key when the entry is a dict.
+        MOVE-01: A file whose content is unchanged (MD5 matches) but whose currently
+        computed S3 key differs from the key recorded when it was last synced means the
+        directory it lives in was renamed/moved on disk — `.milo_backup.info` travels
+        with the directory, so the stale s3_key is exactly the evidence needed to detect
+        this. Such files go to files_to_move (server-side S3 copy, no re-upload) rather
+        than files_to_upload. A None recorded s3_key (legacy entry, see _migrate_entry)
+        is trusted as-is and never triggers a move.
+
+        Handles both the legacy string format and the {md5, mtime, s3_key} dict format
+        in existing_backup_info — extracts the md5/s3_key keys when the entry is a dict.
 
         Args:
             current_files: Current files mapping filename to MD5 string or {md5, mtime} dict
-            existing_backup_info: Existing backup info mapping filename to MD5 string or {md5, mtime} dict
+            existing_backup_info: Existing backup info mapping filename to MD5 string or
+                {md5, mtime, s3_key} dict
+            folder_path: Folder containing these files, used to compute each file's current
+                S3 key for the move-detection comparison
 
         Returns:
-            List of filenames that need to be uploaded
+            Tuple of (files_to_upload, files_to_move) filename lists.
         """
         files_to_upload = []
+        files_to_move = []
 
         for filename, current_entry in current_files.items():
             # Support both bare MD5 strings (pre-Task-2) and new {md5, mtime} dicts
@@ -437,11 +499,20 @@ class FileListener:
             if existing_md5 != current_md5:
                 # File is new or has changed
                 files_to_upload.append(filename)
-            else:
-                # File unchanged
-                self._stats["skipped_files"] += 1
+                continue
 
-        return files_to_upload
+            # MOVE-01: content unchanged — check whether its recorded S3 key is stale.
+            existing_s3_key = existing_entry.get("s3_key") if isinstance(existing_entry, dict) else None
+            if existing_s3_key is not None:
+                current_s3_key = self._build_s3_key(folder_path / filename)
+                if existing_s3_key != current_s3_key:
+                    files_to_move.append(filename)
+                    continue
+
+            # File unchanged, no location drift
+            self._stats["skipped_files"] += 1
+
+        return files_to_upload, files_to_move
 
     async def _upload_single_file(self, filename: str, folder_path: Path) -> Tuple[bool, float]:
         """Upload a single file with semaphore control, capturing st_mtime just before upload (D-02).
@@ -588,6 +659,116 @@ class FileListener:
         logger.info(f"Completed concurrent upload: {len(uploaded_files)} / {len(files_to_upload)} files uploaded")
         return uploaded_files
 
+    async def _move_single_file(self, filename: str, old_s3_key: str, new_s3_key: str) -> bool:
+        """Reconcile one renamed/moved file via server-side S3 copy, under the upload semaphore.
+
+        MOVE-01: shares upload_semaphore with regular uploads since both are bounded S3 API
+        work against the same bucket/rate limit, not separate resource pools.
+
+        Args:
+            filename: Name of file being reconciled (for logging only)
+            old_s3_key: Stale key recorded in .milo_backup.info before the rename
+            new_s3_key: Currently correct key for the file's present location
+
+        Returns:
+            True if the S3-side move succeeded, False otherwise.
+        """
+        async with self.upload_semaphore:
+            try:
+                ok = await self.s3_manager.move_object(old_s3_key, new_s3_key)
+                if not ok:
+                    logger.warning(f"Failed to move {filename}: {old_s3_key} -> {new_s3_key}")
+                return ok
+            except Exception as e:
+                logger.error(f"Error moving {filename}: {e}")
+                self._stats["errors"] += 1
+                return False
+
+    async def _move_with_timeout(self, filename: str, old_s3_key: str, new_s3_key: str) -> Tuple[str, bool]:
+        """Wrap a single move in asyncio.wait_for so its 300s window runs independently (mirrors ASYNC-02).
+
+        Args:
+            filename: Name of file being reconciled
+            old_s3_key: Stale key recorded in .milo_backup.info before the rename
+            new_s3_key: Currently correct key for the file's present location
+
+        Returns:
+            Tuple (filename, success_bool).
+        """
+        try:
+            ok = await asyncio.wait_for(self._move_single_file(filename, old_s3_key, new_s3_key), timeout=300)
+            return filename, bool(ok)
+        except asyncio.TimeoutError:
+            logger.error(f"Move timeout for {filename} (5 minutes)")
+            self._stats["errors"] += 1
+            return filename, False
+        except Exception as e:
+            logger.error(f"Move task failed for {filename}: {e}")
+            self._stats["errors"] += 1
+            return filename, False
+
+    async def _move_files(
+        self, files_to_move: List[str], existing_backup_info: Dict[str, Any], folder_path: Path
+    ) -> Set[str]:
+        """Reconcile renamed/moved files concurrently via server-side S3 copy (MOVE-01).
+
+        Args:
+            files_to_move: Filenames whose content is unchanged but whose recorded S3 key
+                is stale (from _determine_files_to_upload)
+            existing_backup_info: Existing backup info, used to look up each file's stale
+                (pre-rename) s3_key as the CopyObject source
+            folder_path: Folder containing these files, used to compute each file's current
+                (post-rename) S3 key as the CopyObject destination
+
+        Returns:
+            Set of filenames successfully moved. Filenames that fail stay unresolved —
+            still orphaned at the old key and absent from the new key — and are retried
+            on the next scan since their recorded s3_key remains stale.
+        """
+        if not files_to_move:
+            return set()
+
+        logger.info(f"Reconciling {len(files_to_move)} moved/renamed file(s) in {folder_path} via S3 server-side copy")
+
+        tasks: List[asyncio.Task] = []
+        for filename in files_to_move:
+            existing_entry = existing_backup_info.get(filename)
+            old_s3_key = existing_entry.get("s3_key") if isinstance(existing_entry, dict) else None
+            if not old_s3_key:
+                # Should not happen — files_to_move only contains entries with a known s3_key —
+                # but skip defensively rather than call move_object with a bad source key.
+                continue
+            new_s3_key = self._build_s3_key(folder_path / filename)
+            task = asyncio.create_task(
+                self._move_with_timeout(filename, old_s3_key, new_s3_key),
+                name=f"move-{folder_path.name}-{filename}",
+            )
+            self._active_upload_tasks.add(task)
+            task.add_done_callback(self._active_upload_tasks.discard)
+            tasks.append(task)
+
+        if not tasks:
+            return set()
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        moved_files: Set[str] = set()
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"Move coroutine raised unexpectedly: {result}")
+                self._stats["errors"] += 1
+                continue
+            filename, ok = result
+            if ok:
+                moved_files.add(filename)
+                self._stats["moved_files"] += 1
+                logger.info(f"Moved (S3 server-side copy): {filename}")
+            else:
+                logger.warning(f"Move failed for: {filename}")
+
+        logger.info(f"Completed S3 move reconciliation: {len(moved_files)} / {len(files_to_move)} files moved")
+        return moved_files
+
     def _build_s3_key(self, file_path: Path) -> str:
         """Build S3 key for a file path relative to watch folders.
 
@@ -702,6 +883,7 @@ class FileListener:
             "scanned_files": 0,
             "ignored_files": 0,
             "uploaded_files": 0,
+            "moved_files": 0,
             "skipped_files": 0,
             "errors": 0,
         }

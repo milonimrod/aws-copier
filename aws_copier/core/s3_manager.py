@@ -506,6 +506,60 @@ class S3Manager:
             logger.error(f"Unexpected error getting object info: {e}")
             return None
 
+    async def move_object(self, source_key: str, dest_key: str) -> bool:
+        """Move an object within the bucket via server-side CopyObject, then delete the source.
+
+        Used when a file's content is unchanged but its S3 key changed — typically because
+        the local directory it lives in was renamed or moved. A server-side copy avoids
+        re-uploading the file's bytes; MetadataDirective="COPY" preserves the original
+        md5-checksum metadata so the moved object still verifies correctly.
+
+        Args:
+            source_key: Current (prefix-less) S3 key the object lives at.
+            dest_key: New (prefix-less) S3 key it should live at.
+
+        Returns:
+            True if the object was copied to dest_key and the source key removed,
+            False on any failure (including a source object over the 5GB single-call
+            CopyObject limit, or the source object not existing).
+        """
+        try:
+            info = await self.get_object_info(source_key)
+            if info is None:
+                logger.warning(f"move_object: source key not found in S3: {source_key}")
+                return False
+
+            if info["size"] > 5 * 1024 * 1024 * 1024:  # CopyObject single-call limit
+                logger.warning(
+                    f"move_object: {source_key} exceeds the 5GB single-call CopyObject "
+                    f"limit; multipart copy is not implemented, skipping server-side move"
+                )
+                return False
+
+            full_source_key = self._build_s3_key(source_key)
+            full_dest_key = self._build_s3_key(dest_key)
+            client = await self._get_or_create_client()
+
+            await asyncio.wait_for(
+                client.copy_object(
+                    Bucket=self.config.s3_bucket,
+                    CopySource={"Bucket": self.config.s3_bucket, "Key": full_source_key},
+                    Key=full_dest_key,
+                    MetadataDirective="COPY",
+                ),
+                timeout=300,
+            )
+            await asyncio.wait_for(
+                client.delete_object(Bucket=self.config.s3_bucket, Key=full_source_key),
+                timeout=30,
+            )
+            logger.debug(f"Moved S3 object: {full_source_key} -> {full_dest_key}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to move S3 object {source_key} -> {dest_key}: {e}")
+            return False
+
 
 async def main():
     from dotenv import load_dotenv

@@ -340,3 +340,61 @@ class TestS3ManagerBusinessLogic:
         assert manager.config.aws_region == "us-west-2"
         assert manager.config.s3_bucket == "my-bucket"
         assert manager.config.s3_prefix == "my-prefix"
+
+
+class TestS3ManagerMoveObject:
+    """MOVE-01: server-side S3 copy + delete for content-unchanged-but-relocated files."""
+
+    async def test_move_object_success(self, s3_manager):
+        """Successful move issues CopyObject with MetadataDirective=COPY, then deletes the source key."""
+        mock_client = AsyncMock()
+        s3_manager._s3_client = mock_client
+
+        with patch.object(s3_manager, "get_object_info", return_value={"size": 1024}):
+            result = await s3_manager.move_object("OldFolder/file.txt", "NewFolder/file.txt")
+
+        assert result is True
+        mock_client.copy_object.assert_awaited_once_with(
+            Bucket="test-bucket",
+            CopySource={"Bucket": "test-bucket", "Key": "backup/OldFolder/file.txt"},
+            Key="backup/NewFolder/file.txt",
+            MetadataDirective="COPY",
+        )
+        mock_client.delete_object.assert_awaited_once_with(Bucket="test-bucket", Key="backup/OldFolder/file.txt")
+
+    async def test_move_object_source_not_found(self, s3_manager):
+        """A missing source object fails the move without attempting copy or delete."""
+        mock_client = AsyncMock()
+        s3_manager._s3_client = mock_client
+
+        with patch.object(s3_manager, "get_object_info", return_value=None):
+            result = await s3_manager.move_object("Missing/file.txt", "New/file.txt")
+
+        assert result is False
+        mock_client.copy_object.assert_not_called()
+        mock_client.delete_object.assert_not_called()
+
+    async def test_move_object_over_5gb_skips_copy(self, s3_manager):
+        """An object over the 5GB single-call CopyObject limit is not moved (no multipart copy support)."""
+        mock_client = AsyncMock()
+        s3_manager._s3_client = mock_client
+        huge_size = 6 * 1024 * 1024 * 1024
+
+        with patch.object(s3_manager, "get_object_info", return_value={"size": huge_size}):
+            result = await s3_manager.move_object("Big/file.mov", "New/file.mov")
+
+        assert result is False
+        mock_client.copy_object.assert_not_called()
+        mock_client.delete_object.assert_not_called()
+
+    async def test_move_object_copy_failure_does_not_delete_source(self, s3_manager):
+        """If CopyObject fails, the source key must not be deleted (would lose the only copy)."""
+        mock_client = AsyncMock()
+        s3_manager._s3_client = mock_client
+        mock_client.copy_object.side_effect = Exception("boom")
+
+        with patch.object(s3_manager, "get_object_info", return_value={"size": 1024}):
+            result = await s3_manager.move_object("Old/file.txt", "New/file.txt")
+
+        assert result is False
+        mock_client.delete_object.assert_not_called()

@@ -209,32 +209,142 @@ class TestFileListenerOperations:
         assert current_files["file1.txt"]["md5"] == expected_md5
         assert "mtime" in current_files["file1.txt"]
 
-    async def test_determine_files_to_upload_new_files(self, file_listener):
+    async def test_determine_files_to_upload_new_files(self, file_listener, temp_watch_folder):
         """Test determining which files need upload when all are new."""
         current_files = {"file1.txt": "md5_hash_1", "file2.txt": "md5_hash_2"}
         existing_backup_info = {}
 
-        files_to_upload = file_listener._determine_files_to_upload(current_files, existing_backup_info)
+        files_to_upload, files_to_move = file_listener._determine_files_to_upload(
+            current_files, existing_backup_info, temp_watch_folder
+        )
 
         assert set(files_to_upload) == {"file1.txt", "file2.txt"}
+        assert files_to_move == []
 
-    async def test_determine_files_to_upload_changed_files(self, file_listener):
+    async def test_determine_files_to_upload_changed_files(self, file_listener, temp_watch_folder):
         """Test determining which files need upload when some have changed."""
         current_files = {"file1.txt": "new_md5_hash_1", "file2.txt": "md5_hash_2"}
         existing_backup_info = {"file1.txt": "old_md5_hash_1", "file2.txt": "md5_hash_2"}
 
-        files_to_upload = file_listener._determine_files_to_upload(current_files, existing_backup_info)
+        files_to_upload, files_to_move = file_listener._determine_files_to_upload(
+            current_files, existing_backup_info, temp_watch_folder
+        )
 
         assert files_to_upload == ["file1.txt"]  # Only changed file
+        assert files_to_move == []
 
-    async def test_determine_files_to_upload_no_changes(self, file_listener):
+    async def test_determine_files_to_upload_no_changes(self, file_listener, temp_watch_folder):
         """Test determining which files need upload when nothing changed."""
         current_files = {"file1.txt": "md5_hash_1", "file2.txt": "md5_hash_2"}
         existing_backup_info = {"file1.txt": "md5_hash_1", "file2.txt": "md5_hash_2"}
 
-        files_to_upload = file_listener._determine_files_to_upload(current_files, existing_backup_info)
+        files_to_upload, files_to_move = file_listener._determine_files_to_upload(
+            current_files, existing_backup_info, temp_watch_folder
+        )
 
         assert files_to_upload == []
+        assert files_to_move == []
+
+    async def test_determine_files_to_upload_detects_moved_file(self, file_listener, temp_watch_folder):
+        """MOVE-01: unchanged content at a stale recorded s3_key is flagged as a move, not an upload."""
+        current_files = {"file1.txt": {"md5": "same_md5", "mtime": 123.0}}
+        existing_backup_info = {
+            "file1.txt": {"md5": "same_md5", "mtime": 123.0, "s3_key": "OldFolderName/file1.txt"}
+        }
+
+        files_to_upload, files_to_move = file_listener._determine_files_to_upload(
+            current_files, existing_backup_info, temp_watch_folder
+        )
+
+        assert files_to_upload == []
+        assert files_to_move == ["file1.txt"]
+
+    async def test_determine_files_to_upload_legacy_entry_without_s3_key_not_moved(
+        self, file_listener, temp_watch_folder
+    ):
+        """A legacy entry with s3_key=None (post-migration) is trusted, never flagged as a move."""
+        current_files = {"file1.txt": {"md5": "same_md5", "mtime": 123.0}}
+        existing_backup_info = {"file1.txt": {"md5": "same_md5", "mtime": 123.0, "s3_key": None}}
+
+        files_to_upload, files_to_move = file_listener._determine_files_to_upload(
+            current_files, existing_backup_info, temp_watch_folder
+        )
+
+        assert files_to_upload == []
+        assert files_to_move == []
+
+
+class TestFileListenerMoveReconciliation:
+    """MOVE-01 end-to-end: renaming a watched subdirectory on disk must reconcile S3, not skip it.
+
+    Regression coverage for the bug where .milo_backup.info travels with a renamed/moved
+    directory (since it's a file inside that directory), so its stale per-file MD5 entries
+    made the app believe already-synced files were still correctly placed in S3 — even
+    though the S3 key computed for their new location had changed and nothing was ever
+    uploaded there.
+    """
+
+    async def test_renamed_subdirectory_triggers_move_not_reupload(
+        self, file_listener, mock_s3_manager, temp_watch_folder
+    ):
+        old_dir = temp_watch_folder / "album_old"
+        old_dir.mkdir()
+        (old_dir / "photo.jpg").write_text("photo content")
+
+        # Step 1: initial backup of the directory at its original location.
+        await file_listener._process_current_folder(old_dir)
+        assert mock_s3_manager.upload_file.await_count == 1
+
+        s3_folder_name = temp_watch_folder.name
+        old_s3_key = f"{s3_folder_name}/album_old/photo.jpg"
+        new_s3_key = f"{s3_folder_name}/album_new/photo.jpg"
+
+        backup_info = json.loads((old_dir / ".milo_backup.info").read_text())
+        assert backup_info["files"]["photo.jpg"]["s3_key"] == old_s3_key
+
+        # Step 2: rename the directory on disk. .milo_backup.info (with the stale s3_key)
+        # travels with it; the photo's own mtime is untouched by the rename.
+        new_dir = temp_watch_folder / "album_new"
+        old_dir.rename(new_dir)
+
+        mock_s3_manager.upload_file.reset_mock()
+        mock_s3_manager.check_exists.reset_mock()
+        mock_s3_manager.move_object.return_value = True
+
+        # Step 3: scan the directory at its new location.
+        await file_listener._process_current_folder(new_dir)
+
+        # Content is unchanged, so this must be reconciled via server-side move, never a re-upload.
+        mock_s3_manager.upload_file.assert_not_awaited()
+        mock_s3_manager.move_object.assert_awaited_once_with(old_s3_key, new_s3_key)
+
+        updated_backup_info = json.loads((new_dir / ".milo_backup.info").read_text())
+        assert updated_backup_info["files"]["photo.jpg"]["s3_key"] == new_s3_key
+        assert file_listener.get_statistics()["moved_files"] == 1
+
+    async def test_renamed_subdirectory_reupload_falls_back_when_move_fails(
+        self, file_listener, mock_s3_manager, temp_watch_folder
+    ):
+        """A failed S3-side move leaves the stale s3_key in place so the next scan retries it."""
+        old_dir = temp_watch_folder / "album_old"
+        old_dir.mkdir()
+        (old_dir / "photo.jpg").write_text("photo content")
+        await file_listener._process_current_folder(old_dir)
+
+        new_dir = temp_watch_folder / "album_new"
+        old_dir.rename(new_dir)
+
+        mock_s3_manager.upload_file.reset_mock()
+        mock_s3_manager.move_object.return_value = False  # simulate S3-side failure
+
+        await file_listener._process_current_folder(new_dir)
+
+        s3_folder_name = temp_watch_folder.name
+        old_s3_key = f"{s3_folder_name}/album_old/photo.jpg"
+        updated_backup_info = json.loads((new_dir / ".milo_backup.info").read_text())
+        # Stale entry preserved (not silently marked as synced at the new key) so the next
+        # scan's _determine_files_to_upload still detects the mismatch and retries the move.
+        assert updated_backup_info["files"]["photo.jpg"]["s3_key"] == old_s3_key
 
 
 class TestFileListenerUploads:
@@ -413,8 +523,8 @@ class TestFileListenerBackupInfo:
         loaded_info = await file_listener._load_backup_info(backup_info_file)
 
         assert loaded_info == {
-            "file1.txt": {"md5": "md5_hash_1", "mtime": 0.0},
-            "file2.txt": {"md5": "md5_hash_2", "mtime": 0.0},
+            "file1.txt": {"md5": "md5_hash_1", "mtime": 0.0, "s3_key": None},
+            "file2.txt": {"md5": "md5_hash_2", "mtime": 0.0, "s3_key": None},
         }
 
     async def test_load_backup_info_nonexistent_file(self, file_listener, temp_watch_folder):
@@ -581,7 +691,7 @@ class TestFileListenerAsyncBackupIO:
         backup_file.write_text('{"timestamp": "2026-01-01T00:00:00", "files": {"a.txt": "hash1"}}')
         with patch("aws_copier.core.file_listener.aiofiles.open", wraps=__import__("aiofiles").open) as mock_open:
             result = await file_listener._load_backup_info(backup_file)
-        assert result == {"a.txt": {"md5": "hash1", "mtime": 0.0}}
+        assert result == {"a.txt": {"md5": "hash1", "mtime": 0.0, "s3_key": None}}
         assert mock_open.call_count == 1
 
     async def test_update_backup_info_uses_aiofiles_and_lock(self, file_listener, tmp_path):
@@ -705,17 +815,27 @@ class TestBackupInfoMigrationAndCache:
         backup_file = temp_watch_folder / ".milo_backup.info"
         backup_file.write_text(json.dumps({"files": {"a.txt": "abc123"}}))
         result = await file_listener._load_backup_info(backup_file)
-        assert result == {"a.txt": {"md5": "abc123", "mtime": 0.0}}
+        assert result == {"a.txt": {"md5": "abc123", "mtime": 0.0, "s3_key": None}}
 
     async def test_load_preserves_new_dict_format(self, file_listener, temp_watch_folder):
-        """New dict-format entries pass through unchanged."""
+        """Dict-format entries that already include s3_key pass through unchanged."""
+        import json
+
+        backup_file = temp_watch_folder / ".milo_backup.info"
+        payload = {"files": {"a.txt": {"md5": "abc123", "mtime": 1234.5, "s3_key": "Documents/a.txt"}}}
+        backup_file.write_text(json.dumps(payload))
+        result = await file_listener._load_backup_info(backup_file)
+        assert result == {"a.txt": {"md5": "abc123", "mtime": 1234.5, "s3_key": "Documents/a.txt"}}
+
+    async def test_load_backfills_s3_key_when_missing(self, file_listener, temp_watch_folder):
+        """Dict-format entries from before the s3_key field existed are backfilled with None (MOVE-01)."""
         import json
 
         backup_file = temp_watch_folder / ".milo_backup.info"
         payload = {"files": {"a.txt": {"md5": "abc123", "mtime": 1234.5}}}
         backup_file.write_text(json.dumps(payload))
         result = await file_listener._load_backup_info(backup_file)
-        assert result == {"a.txt": {"md5": "abc123", "mtime": 1234.5}}
+        assert result == {"a.txt": {"md5": "abc123", "mtime": 1234.5, "s3_key": None}}
 
     async def test_load_returns_empty_when_file_missing(self, file_listener, temp_watch_folder):
         """Non-existent backup info file returns empty dict."""
@@ -738,7 +858,7 @@ class TestBackupInfoMigrationAndCache:
         with patch.object(flmod, "aiofiles") as mock_af:
             result = await file_listener._load_backup_info(backup_file)
             mock_af.open.assert_not_called()
-        assert result == {"a.txt": {"md5": "x", "mtime": 1.0}}
+        assert result == {"a.txt": {"md5": "x", "mtime": 1.0, "s3_key": None}}
 
     async def test_load_re_reads_when_disk_mtime_changes(self, file_listener, temp_watch_folder):
         """Disk read is triggered when .milo_backup.info mtime changes (cache miss)."""
