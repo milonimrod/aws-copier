@@ -35,7 +35,28 @@ Restart policy is `unless-stopped`, so the daemon comes back up after a NAS rebo
 ### Building elsewhere and copying the image to the NAS
 
 If you'd rather not build on the NAS itself (slower CPU, no build tools, etc.), build on
-another machine and transfer the image instead of using `--build` in step 3 above:
+another machine and transfer the image instead of using `--build` above.
+
+**One-command deploy** (recommended, once set up): `docker/deploy.sh` builds, exports, and
+remotely loads + restarts the container on the NAS in a single call. Requires:
+- The NAS's docker share mounted locally over NFS/SMB (see `NAS_LOCAL_DIR` below) — the
+  built image is dropped straight onto it, no separate copy step.
+- Passwordless SSH to the NAS (`ssh-copy-id <user>@<nas-ip>` once).
+- Your NAS SSH user in the `docker` group (`sudo usermod -aG docker <user>` on the NAS,
+  then open a *new* SSH session — group membership only applies to fresh logins), so it can
+  talk to the Docker socket without needing a password each deploy.
+
+```bash
+docker/deploy.sh amd64   # or arm64 — must match the NAS's architecture
+```
+
+Defaults assume this machine's actual setup; override via env vars if yours differs:
+`NAS_HOST` (default `192.168.8.201`), `NAS_SSH_USER` (default `Nimrod Milo`),
+`NAS_LOCAL_DIR` (local NFS-mounted path to the NAS's aws-copier folder, default
+`/mnt/nas-docker/aws-copier`), `NAS_REMOTE_DIR` (that same folder's path as seen on the NAS
+itself, default `/volume1/docker/aws-copier`).
+
+**Manual steps**, if you'd rather not set up SSH access:
 
 1. Check the NAS's CPU architecture once, e.g. `ssh <user>@<nas-ip> uname -m` — `x86_64`
    means `amd64`, `aarch64` means `arm64`.
