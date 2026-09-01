@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import random
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -19,6 +20,12 @@ from aws_copier.core.s3_manager import S3Manager
 from aws_copier.models.simple_config import SimpleConfig
 
 logger = logging.getLogger(__name__)
+
+# DOCKER-01: tqdm's carriage-return progress redraws render as garbled, duplicated lines
+# through `docker logs` (no TTY — every redraw becomes its own log line instead of
+# overwriting in place). Disabled whenever stdout isn't a real terminal; the web dashboard
+# (aws_copier/web/dashboard.py) is the progress UI for that case instead.
+_TQDM_DISABLE = not sys.stdout.isatty()
 
 
 class FileListener:
@@ -431,7 +438,13 @@ class FileListener:
             logger.debug(f"Computing MD5 for {len(files_to_hash)} files in parallel (max 50 concurrent)")
 
             # Gather all MD5 tasks concurrently; done callbacks tick the progress bar.
-            pbar = sync_tqdm(total=len(md5_tasks), desc=f"Hashing  {folder_path.name}", unit="file", leave=False)
+            pbar = sync_tqdm(
+                total=len(md5_tasks),
+                desc=f"Hashing  {folder_path.name}",
+                unit="file",
+                leave=False,
+                disable=_TQDM_DISABLE,
+            )
             for _, task in md5_tasks:
                 task.add_done_callback(lambda _f: pbar.update())
             results = await asyncio.gather(*(task for _, task in md5_tasks), return_exceptions=True)
@@ -637,7 +650,9 @@ class FileListener:
 
         # Gather all upload coroutines concurrently; return_exceptions=True prevents one
         # failure from cancelling the rest. Done callbacks tick the progress bar.
-        pbar = sync_tqdm(total=len(tasks), desc=f"Uploading {folder_path.name}", unit="file", leave=True)
+        pbar = sync_tqdm(
+            total=len(tasks), desc=f"Uploading {folder_path.name}", unit="file", leave=True, disable=_TQDM_DISABLE
+        )
         for task in tasks:
             task.add_done_callback(lambda _f: pbar.update())
         results = await asyncio.gather(*tasks, return_exceptions=True)

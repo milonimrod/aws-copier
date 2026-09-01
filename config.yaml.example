@@ -9,5 +9,4 @@ web_port: 8765
 # Keys are container paths — must match the mount points in docker-compose.yml, not
 # host/NAS paths. Values are the S3 folder name each one is uploaded under.
 watch_folders:
-  /data/documents: Documents
   /data/pictures: Pictures

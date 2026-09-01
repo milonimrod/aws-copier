@@ -47,8 +47,8 @@ def test_config_yaml_example_loads_into_simple_config():
     assert config.web_port == 8765
     assert config.web_enabled is True
     # watch_folders keys are container paths matching docker-compose.yml's mount targets.
-    assert Path("/data/documents") in config.watch_folders
-    assert config.get_s3_name_for_folder(Path("/data/documents")) == "Documents"
+    assert Path("/data/pictures") in config.watch_folders
+    assert config.get_s3_name_for_folder(Path("/data/pictures")) == "Pictures"
 
 
 def test_config_yaml_example_matches_compose_mount_targets():
