@@ -921,6 +921,44 @@ class TestBackupInfoMigrationAndCache:
         second = await file_listener._load_backup_info(backup_file)
         assert second["a.txt"]["md5"] == "v2"
 
+    async def test_clear_caches_empties_cache_and_mtime_dicts(self, file_listener, temp_watch_folder):
+        """MEM-01: clear_caches() drops the PERF-02 cache so long-running memory doesn't grow unbounded."""
+        import json
+
+        backup_file = temp_watch_folder / ".milo_backup.info"
+        backup_file.write_text(json.dumps({"files": {"a.txt": {"md5": "x", "mtime": 1.0}}}))
+        await file_listener._load_backup_info(backup_file)  # populates the cache
+        assert file_listener._backup_info_cache
+        assert file_listener._backup_info_mtime
+
+        file_listener.clear_caches()
+
+        assert file_listener._backup_info_cache == {}
+        assert file_listener._backup_info_mtime == {}
+
+    async def test_clear_caches_forces_disk_reread_but_preserves_content(self, file_listener, temp_watch_folder):
+        """After clearing, the next load is a cache miss but still returns correct data (no data loss)."""
+        import json
+
+        backup_file = temp_watch_folder / ".milo_backup.info"
+        backup_file.write_text(json.dumps({"files": {"a.txt": {"md5": "x", "mtime": 1.0}}}))
+        await file_listener._load_backup_info(backup_file)
+        file_listener.clear_caches()
+
+        import aws_copier.core.file_listener as flmod
+        from unittest.mock import patch
+
+        with patch.object(flmod, "aiofiles", wraps=flmod.aiofiles) as spy_aiofiles:
+            result = await file_listener._load_backup_info(backup_file)
+            spy_aiofiles.open.assert_called_once()
+        assert result == {"a.txt": {"md5": "x", "mtime": 1.0, "s3_key": None}}
+
+    def test_clear_caches_does_not_remove_folder_locks(self, file_listener, temp_watch_folder):
+        """_folder_locks is intentionally untouched — small, and unsafe to prune mid-flight."""
+        lock = file_listener._get_folder_lock(temp_watch_folder)
+        file_listener.clear_caches()
+        assert file_listener._get_folder_lock(temp_watch_folder) is lock
+
 
 class TestMtimeSkip:
     """PERF-01: mtime-skip in _scan_current_files and D-02 upload_mtime capture."""

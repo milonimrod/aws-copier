@@ -56,6 +56,7 @@ def patched_app_explicit_creds():
         fl = AsyncMock()
         fl.scan_all_folders = AsyncMock()
         fl.get_statistics = MagicMock(return_value={})
+        fl.clear_caches = MagicMock()
         fl._active_upload_tasks = set()
         mock_fl_cls.return_value = fl
 
@@ -89,6 +90,7 @@ def patched_app_chain_creds():
         fl = AsyncMock()
         fl.scan_all_folders = AsyncMock()
         fl.get_statistics = MagicMock(return_value={})
+        fl.clear_caches = MagicMock()
         fl._active_upload_tasks = set()
         mock_fl_cls.return_value = fl
 
@@ -173,6 +175,51 @@ class TestStartupWiring:
         s3.ensure_lifecycle_rule.return_value = None
         # Must complete without raising
         await app.start()
+
+
+class TestMemoryHousekeeping:
+    """MEM-01: the status loop clears the backup-info cache and trims freed heap each pass."""
+
+    async def test_status_loop_clears_file_listener_caches(self, patched_app_explicit_creds):
+        """clear_caches() is called during the (short-circuited, single-pass) status loop."""
+        app, s3, fl, fw, cfg = patched_app_explicit_creds
+        await app.start()
+        fl.clear_caches.assert_called_once()
+
+    async def test_status_loop_calls_trim_memory(self, patched_app_explicit_creds):
+        """_trim_memory() is invoked each status loop pass."""
+        app, s3, fl, fw, cfg = patched_app_explicit_creds
+        with patch.object(main_module, "_trim_memory") as mock_trim:
+            await app.start()
+        mock_trim.assert_called_once()
+
+    def test_trim_memory_noop_on_non_linux(self):
+        """_trim_memory does nothing (no ctypes/libc call) on platforms without glibc."""
+        with (
+            patch.object(main_module.sys, "platform", "darwin"),
+            patch.object(main_module.ctypes, "CDLL") as mock_cdll,
+        ):
+            main_module._trim_memory()
+        mock_cdll.assert_not_called()
+
+    def test_trim_memory_calls_malloc_trim_on_linux(self):
+        """_trim_memory calls libc's malloc_trim(0) on Linux."""
+        mock_libc = MagicMock()
+        with (
+            patch.object(main_module.sys, "platform", "linux"),
+            patch.object(main_module.ctypes, "CDLL", return_value=mock_libc) as mock_cdll,
+        ):
+            main_module._trim_memory()
+        mock_cdll.assert_called_once_with("libc.so.6")
+        mock_libc.malloc_trim.assert_called_once_with(0)
+
+    def test_trim_memory_swallows_errors(self):
+        """_trim_memory never raises, even if libc/malloc_trim is unavailable."""
+        with (
+            patch.object(main_module.sys, "platform", "linux"),
+            patch.object(main_module.ctypes, "CDLL", side_effect=OSError("no libc")),
+        ):
+            main_module._trim_memory()  # must not raise
 
 
 class TestConfigPathWiring:

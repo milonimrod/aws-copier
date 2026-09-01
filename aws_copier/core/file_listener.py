@@ -913,3 +913,20 @@ class FileListener:
             "skipped_files": 0,
             "errors": 0,
         }
+
+    def clear_caches(self) -> None:
+        """Drop the in-memory backup-info cache (PERF-02) to bound memory over a long run.
+
+        MEM-01: _backup_info_cache/_backup_info_mtime accumulate one entry per folder ever
+        scanned or touched by a real-time event, for the lifetime of the process — for a
+        large library (many thousands of directories) this is the main unbounded-growth
+        point. Safe to clear at any time: the next _load_backup_info call for any folder
+        just becomes a cache miss and re-reads that folder's .milo_backup.info from disk (a
+        cheap stat + JSON parse), losing no correctness.
+
+        _folder_locks is deliberately left untouched — Lock objects are tiny (not worth
+        reclaiming), and removing one while a coroutine might still hold a reference to it
+        could let two different Lock instances end up guarding the same folder concurrently.
+        """
+        self._backup_info_cache.clear()
+        self._backup_info_mtime.clear()

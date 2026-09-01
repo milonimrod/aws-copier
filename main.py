@@ -2,6 +2,7 @@
 
 import asyncio
 import ctypes
+import gc
 import logging
 import signal
 import sys
@@ -16,6 +17,23 @@ from aws_copier.web.dashboard import WebDashboard
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def _trim_memory() -> None:
+    """Best-effort: ask glibc to release freed heap arenas back to the OS (MEM-01, Linux only).
+
+    gc.collect() alone often doesn't shrink RSS on Linux — glibc's malloc keeps freed arenas
+    around for reuse rather than returning them to the OS, which is what makes a long-running
+    daemon's memory usage look like it never comes back down after a large initial scan even
+    once the objects are gone. malloc_trim(0) asks it to release what it safely can. Silently
+    does nothing on platforms without glibc (macOS, Windows) or if the call is unavailable.
+    """
+    if sys.platform != "linux":
+        return
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception as exc:
+        logger.debug(f"malloc_trim unavailable: {exc}")
 
 
 def _disable_quickedit_windows() -> None:
@@ -103,6 +121,15 @@ class AWSCopierApp:
             while self.running:
                 stats = self.file_listener.get_statistics()
                 logger.info(f"📊 Backup Status: {stats}")
+
+                # MEM-01: periodic housekeeping — drop the per-folder backup-info cache
+                # (the main unbounded-growth point for a large library) and ask the
+                # allocator to release freed memory back to the OS, so RSS doesn't stay
+                # pinned at the peak from a large initial scan for the rest of the process's
+                # life.
+                self.file_listener.clear_caches()
+                gc.collect()
+                _trim_memory()
 
                 # Wait for shutdown event or timeout (5 minutes)
                 try:
