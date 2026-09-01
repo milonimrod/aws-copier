@@ -528,7 +528,12 @@ class FileListener:
         return files_to_upload, files_to_move
 
     async def _upload_single_file(self, filename: str, folder_path: Path) -> Tuple[bool, float]:
-        """Upload a single file with semaphore control, capturing st_mtime just before upload (D-02).
+        """Upload a single file, capturing st_mtime just before upload (D-02).
+
+        CONC-01: does NOT acquire upload_semaphore itself — the caller (_upload_with_timeout)
+        holds it for exactly the duration of this call, so time spent queued waiting for a
+        free slot is never charged against this file's timeout window (see CONC-01 note on
+        _upload_with_timeout for why that distinction matters).
 
         Args:
             filename: Name of file to upload
@@ -539,61 +544,68 @@ class FileListener:
             captured immediately before the upload call, so a file modified during upload
             is detected on the next scan cycle. Returns (False, 0.0) on any failure.
         """
-        async with self.upload_semaphore:
-            file_path = folder_path / filename
+        file_path = folder_path / filename
 
-            logger.info(f"Uploading file: {file_path}")
-            try:
-                # Build S3 key relative to watch folder root
-                s3_key = self._build_s3_key(file_path)
+        logger.info(f"Uploading file: {file_path}")
+        try:
+            # Build S3 key relative to watch folder root
+            s3_key = self._build_s3_key(file_path)
 
-                # Calculate local MD5
-                local_md5 = await self._calculate_md5(file_path)
-                if not local_md5:
-                    logger.error(f"Failed to calculate MD5 for {file_path}")
-                    self._stats["errors"] += 1
-                    return False, 0.0
+            # Calculate local MD5
+            local_md5 = await self._calculate_md5(file_path)
+            if not local_md5:
+                logger.error(f"Failed to calculate MD5 for {file_path}")
+                self._stats["errors"] += 1
+                return False, 0.0
 
-                # Check if file exists in S3 with same MD5
-                if await self.s3_manager.check_exists(s3_key, local_md5):
-                    logger.info(f"File already exists in S3 with same MD5: {s3_key}")
-                    self._stats["skipped_files"] += 1
-                    # Capture mtime for already-synced file so it can be recorded
-                    try:
-                        upload_mtime = file_path.stat().st_mtime
-                    except OSError:
-                        upload_mtime = 0.0
-                    return True, upload_mtime
-
-                # D-02: capture st_mtime just before upload so a file modified during upload
-                # is detected on the next cycle (we record what we actually uploaded).
+            # Check if file exists in S3 with same MD5
+            if await self.s3_manager.check_exists(s3_key, local_md5):
+                logger.info(f"File already exists in S3 with same MD5: {s3_key}")
+                self._stats["skipped_files"] += 1
+                # Capture mtime for already-synced file so it can be recorded
                 try:
                     upload_mtime = file_path.stat().st_mtime
                 except OSError:
                     upload_mtime = 0.0
+                return True, upload_mtime
 
-                # Upload file
-                if await self.s3_manager.upload_file(file_path, s3_key, precomputed_md5=local_md5):
-                    self._stats["uploaded_files"] += 1
-                    logger.info(f"Uploaded: {file_path} -> {s3_key}")
-                    return True, upload_mtime
-                else:
-                    logger.error(f"Failed to upload: {file_path}")
-                    self._stats["errors"] += 1
-                    return False, 0.0
+            # D-02: capture st_mtime just before upload so a file modified during upload
+            # is detected on the next cycle (we record what we actually uploaded).
+            try:
+                upload_mtime = file_path.stat().st_mtime
+            except OSError:
+                upload_mtime = 0.0
 
-            except Exception as e:
-                logger.error(f"Error uploading {file_path}: {e}")
+            # Upload file
+            if await self.s3_manager.upload_file(file_path, s3_key, precomputed_md5=local_md5):
+                self._stats["uploaded_files"] += 1
+                logger.info(f"Uploaded: {file_path} -> {s3_key}")
+                return True, upload_mtime
+            else:
+                logger.error(f"Failed to upload: {file_path}")
                 self._stats["errors"] += 1
                 return False, 0.0
 
+        except Exception as e:
+            logger.error(f"Error uploading {file_path}: {e}")
+            self._stats["errors"] += 1
+            return False, 0.0
+
     async def _upload_with_timeout(self, filename: str, folder_path: Path) -> Tuple[str, bool, float]:
-        """Wrap a single upload in asyncio.wait_for so the timeout window belongs to the coroutine, not the task.
+        """Acquire the upload semaphore, then bound the upload itself in asyncio.wait_for.
 
         ASYNC-02 Pitfall 1 fix: when wait_for was applied to an already-created task
         inside a serial for-loop, the N-th file's timeout window began only after the
         (N-1)-th completed or timed out. Wrapping the coroutine BEFORE create_task ensures
         each file gets its own independent timeout window running concurrently.
+
+        CONC-01: the semaphore is acquired BEFORE the timed region starts, not inside it.
+        With hundreds of small files queued behind a few large/slow uploads (all sharing one
+        semaphore), a file blocked waiting for a free slot was previously burning down its
+        own timeout window while doing nothing — once enough large uploads occupied every
+        slot for a while, every queued file would then time out in the same instant the
+        moment their (uncounted-down-from-zero) window elapsed, even though none of them had
+        actually started transferring. The timeout must bound the transfer, not the queue.
 
         PERF-05: the window scales with this file's size (estimate_upload_timeout) instead
         of a fixed 300s. This is the binding bound for large (>100MB, multipart) files —
@@ -614,17 +626,20 @@ class FileListener:
         except OSError:
             file_size = 0
         timeout = estimate_upload_timeout(file_size)
-        try:
-            ok, upload_mtime = await asyncio.wait_for(self._upload_single_file(filename, folder_path), timeout=timeout)
-            return filename, bool(ok), upload_mtime
-        except asyncio.TimeoutError:
-            logger.error(f"Upload timeout for {filename} ({timeout}s, {file_size / (1024 * 1024):.1f}MB)")
-            self._stats["errors"] += 1
-            return filename, False, 0.0
-        except Exception as e:
-            logger.error(f"Upload task failed for {filename}: {e}")
-            self._stats["errors"] += 1
-            return filename, False, 0.0
+        async with self.upload_semaphore:
+            try:
+                ok, upload_mtime = await asyncio.wait_for(
+                    self._upload_single_file(filename, folder_path), timeout=timeout
+                )
+                return filename, bool(ok), upload_mtime
+            except asyncio.TimeoutError:
+                logger.error(f"Upload timeout for {filename} ({timeout}s, {file_size / (1024 * 1024):.1f}MB)")
+                self._stats["errors"] += 1
+                return filename, False, 0.0
+            except Exception as e:
+                logger.error(f"Upload task failed for {filename}: {e}")
+                self._stats["errors"] += 1
+                return filename, False, 0.0
 
     async def _upload_files(self, files_to_upload: List[str], folder_path: Path) -> Dict[str, float]:
         """Upload files to S3 concurrently using asyncio.gather.

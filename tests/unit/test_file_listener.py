@@ -386,6 +386,48 @@ class TestFileListenerUploads:
 
         spy.assert_called_once_with(0)
 
+    async def test_semaphore_wait_does_not_count_against_timeout(self, file_listener, temp_watch_folder):
+        """CONC-01 regression: a file queued behind a slow upload must not time out merely from waiting.
+
+        Before the fix, the timeout clock started at task creation — including time spent
+        blocked on the semaphore. With many small files queued behind a few slow/large
+        uploads all sharing one semaphore slot, queued files would time out having done
+        nothing at all, the instant their window elapsed while still waiting in line.
+        """
+        file_listener.upload_semaphore = asyncio.Semaphore(1)
+
+        slow_file = temp_watch_folder / "slow_occupant.bin"
+        slow_file.write_bytes(b"S" * 100)
+        queued_file = temp_watch_folder / "queued_fast.bin"
+        queued_file.write_bytes(b"Q" * 50)
+
+        async def upload_side_effect(local_path, s3_key, precomputed_md5=None):
+            if local_path.name == "slow_occupant.bin":
+                await asyncio.sleep(0.2)
+            return True
+
+        file_listener.s3_manager.check_exists.return_value = False
+        file_listener.s3_manager.upload_file.side_effect = upload_side_effect
+
+        with patch(
+            "aws_copier.core.file_listener.estimate_upload_timeout",
+            side_effect=lambda size: 5.0 if size == 100 else 0.05,
+        ):
+            # Start the slow upload first and yield once so it acquires the sole semaphore
+            # slot before the queued file's task is even created — deterministic ordering.
+            slow_task = asyncio.create_task(file_listener._upload_with_timeout("slow_occupant.bin", temp_watch_folder))
+            await asyncio.sleep(0)
+            queued_task = asyncio.create_task(
+                file_listener._upload_with_timeout("queued_fast.bin", temp_watch_folder)
+            )
+            slow_result, queued_result = await asyncio.gather(slow_task, queued_task)
+
+        assert slow_result[1] is True
+        # The queued file's own 0.05s window only starts once it acquires the semaphore
+        # (after the ~0.2s slow upload releases it) — its actual upload is near-instant, so
+        # it must succeed rather than time out from the ~0.2s it spent merely queued.
+        assert queued_result[1] is True
+
     async def test_upload_files_with_s3_check_skip(self, file_listener, temp_watch_folder):
         """Test upload with S3 existence check - files already exist in S3."""
         # Configure mock to return True for check_exists (file already exists)
