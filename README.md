@@ -32,6 +32,27 @@ it on a NAS.
 
 Restart policy is `unless-stopped`, so the daemon comes back up after a NAS reboot.
 
+### Building elsewhere and copying the image to the NAS
+
+If you'd rather not build on the NAS itself (slower CPU, no build tools, etc.), build on
+another machine and transfer the image instead of using `--build` in step 3 above:
+
+1. Check the NAS's CPU architecture once, e.g. `ssh <user>@<nas-ip> uname -m` — `x86_64`
+   means `amd64`, `aarch64` means `arm64`.
+2. On the build machine:
+   ```bash
+   docker/build-and-export.sh amd64   # or arm64 — matches the NAS's architecture
+   ```
+   This produces `aws-copier-<arch>.tar.gz`. Cross-building `arm64` from an `amd64` machine
+   (or vice versa) needs QEMU emulation registered with buildx first (one-time):
+   `docker run --privileged --rm tonistiige/binfmt --install all`.
+3. Copy the tarball to a location the NAS can reach (a shared folder, `scp`, etc.), then on
+   the NAS:
+   ```bash
+   docker load -i aws-copier-<arch>.tar.gz
+   docker compose up -d   # no --build — uses the image you just loaded
+   ```
+
 ## Quick Start (local / dev, without Docker)
 
 1. Install dependencies:

@@ -1,5 +1,10 @@
 services:
   aws-copier:
+    # `image:` names the tag `docker load -i aws-copier-*.tar.gz` produces, so
+    # `docker compose up -d` (no --build) uses an image built elsewhere and copied over —
+    # see docker/build-and-export.sh. `build: .` is also here so building in place on the
+    # NAS with `docker compose up -d --build` still works if you'd rather do that instead.
+    image: aws-copier:latest
     build: .
     container_name: aws-copier
     restart: unless-stopped
