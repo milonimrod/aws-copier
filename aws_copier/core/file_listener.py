@@ -48,6 +48,13 @@ class FileListener:
         # Separate semaphore for MD5 computation to avoid blocking uploads.
         self.md5_semaphore = asyncio.Semaphore(10)
 
+        # CONC-02: bounds how many folders' _process_current_folder (load backup info, scan,
+        # hash, upload) run concurrently during a recursive scan. Tree traversal itself
+        # (listing subdirs, recursing) is NOT bounded by this — only the actual per-folder
+        # work is throttled, so folder discovery races ahead of processing rather than the
+        # whole tree being walked strictly one folder at a time.
+        self.folder_semaphore = asyncio.Semaphore(20)
+
         # ASYNC-03: per-folder asyncio.Lock registry. Protects read-modify-write on
         # .milo_backup.info against concurrent scan + real-time event hitting the same folder.
         self._folder_locks: Dict[Path, asyncio.Lock] = {}
@@ -193,6 +200,17 @@ class FileListener:
     async def _process_folder_recursively(self, folder_path: Path) -> None:
         """Process a folder and all its subfolders recursively.
 
+        CONC-02: subfolders are recursed into concurrently rather than one at a time — the
+        old strictly-sequential (depth-first, one folder fully finished before the next
+        starts) traversal meant that for a library with many small folders (the common case:
+        date/event-based photo organization), most of the scan's wall-clock time was spent
+        on fixed per-folder overhead (directory listing, stat calls, loading
+        .milo_backup.info) happening one folder at a time, while the existing
+        md5_semaphore/upload_semaphore capacity sat mostly idle. Actual per-folder work is
+        still throttled via folder_semaphore, so this doesn't remove the existing
+        concurrency limits — it lets already-discovered folders' work overlap instead of
+        serializing purely because of tree structure.
+
         Args:
             folder_path: Path to folder to process
         """
@@ -204,18 +222,18 @@ class FileListener:
             logger.info(f"Processing folder: {folder_path}")
             self._stats["scanned_folders"] += 1
 
-            # Step 1: Process current folder
-            await self._process_current_folder(folder_path)
+            # Step 1: Process current folder (throttled — see CONC-02 above)
+            async with self.folder_semaphore:
+                await self._process_current_folder(folder_path)
 
-            # Step 2: Process all subfolders recursively in random order so each run
-            # covers a different slice of the tree first, preventing starvation of deep dirs.
+            # Step 2: Process all subfolders concurrently, in random order so each run
+            # covers a different slice of the tree first under contention.
             try:
                 subdirs = [
                     item for item in folder_path.iterdir() if item.is_dir() and not IGNORE_RULES.should_ignore_dir(item)
                 ]
                 random.shuffle(subdirs)
-                for item in subdirs:
-                    await self._process_folder_recursively(item)
+                await asyncio.gather(*(self._process_folder_recursively(item) for item in subdirs))
             except PermissionError:
                 logger.warning(f"Permission denied accessing folder: {folder_path}")
             except Exception as e:

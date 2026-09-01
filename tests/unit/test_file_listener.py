@@ -348,6 +348,61 @@ class TestFileListenerMoveReconciliation:
         assert updated_backup_info["files"]["photo.jpg"]["s3_key"] == old_s3_key
 
 
+class TestConcurrentFolderTraversal:
+    """CONC-02: sibling folders are processed concurrently, throttled by folder_semaphore."""
+
+    async def test_sibling_folders_process_concurrently(self, file_listener, temp_watch_folder):
+        """Multiple sibling folders' _process_current_folder calls overlap, not run one at a time."""
+        for i in range(6):
+            d = temp_watch_folder / f"event_{i}"
+            d.mkdir()
+            (d / "photo.jpg").write_text(f"content {i}")
+
+        file_listener.folder_semaphore = asyncio.Semaphore(3)
+
+        in_flight = 0
+        max_in_flight = 0
+        lock = asyncio.Lock()
+        original = file_listener._process_current_folder
+
+        async def instrumented(folder_path):
+            nonlocal in_flight, max_in_flight
+            async with lock:
+                in_flight += 1
+                max_in_flight = max(max_in_flight, in_flight)
+            await asyncio.sleep(0.02)
+            result = await original(folder_path)
+            async with lock:
+                in_flight -= 1
+            return result
+
+        file_listener._process_current_folder = instrumented
+
+        await file_listener._process_folder_recursively(temp_watch_folder)
+
+        assert max_in_flight > 1  # actually concurrent, not accidentally serialized
+        assert max_in_flight <= 3  # respects folder_semaphore
+
+    async def test_all_folders_still_processed_correctly(self, file_listener, temp_watch_folder):
+        """Concurrent traversal still visits and uploads every folder in the tree (no folder dropped)."""
+        for i in range(5):
+            d = temp_watch_folder / f"event_{i}"
+            d.mkdir()
+            (d / "photo.jpg").write_text(f"content {i}")
+
+        await file_listener._process_folder_recursively(temp_watch_folder)
+
+        for i in range(5):
+            info_file = temp_watch_folder / f"event_{i}" / ".milo_backup.info"
+            assert info_file.exists()
+            data = json.loads(info_file.read_text())
+            assert "photo.jpg" in data["files"]
+
+        stats = file_listener.get_statistics()
+        # 5 new event folders + root + existing subdir/nested from the fixture
+        assert stats["scanned_folders"] >= 5
+
+
 class TestFileListenerUploads:
     """Test FileListener upload operations."""
 
