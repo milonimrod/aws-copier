@@ -25,6 +25,14 @@ _MIN_ASSUMED_UPLOAD_BYTES_PER_SEC = 1024 * 1024
 _UPLOAD_TIMEOUT_FLOOR_SECONDS = 300
 _UPLOAD_TIMEOUT_BUFFER_SECONDS = 60
 
+# PERF-06: multipart parts were uploaded one at a time, each waiting on the previous part's
+# full network round-trip — capping per-file throughput at roughly one 5MB chunk per
+# round-trip regardless of actual available bandwidth (observed as a hard ~5MB/s ceiling on
+# large video uploads). Uploading up to this many parts concurrently lets a single large
+# file actually saturate the connection, matching the concurrency AWS's own CLI/SDK tools
+# default to for multipart uploads.
+_MULTIPART_CONCURRENCY = 8
+
 
 def estimate_upload_timeout(file_size: int) -> int:
     """Scale an upload timeout with file size so large files aren't cut off mid-transfer.
@@ -415,8 +423,41 @@ class S3Manager:
             "file-size": str(local_path.stat().st_size),
         }
 
+    async def _upload_part(self, client: Any, s3_key: str, upload_id: str, part_number: int, chunk: bytes) -> Dict[str, Any]:
+        """Upload a single multipart part.
+
+        Args:
+            client: Active aiobotocore S3 client
+            s3_key: S3 key (with prefix) of the object being uploaded
+            upload_id: Multipart upload ID from create_multipart_upload
+            part_number: 1-based part number
+            chunk: Part body bytes
+
+        Returns:
+            {"ETag": ..., "PartNumber": ...} for use in complete_multipart_upload's Parts list.
+        """
+        part_response = await asyncio.wait_for(
+            client.upload_part(
+                Bucket=self.config.s3_bucket,
+                Key=s3_key,
+                PartNumber=part_number,
+                UploadId=upload_id,
+                Body=chunk,
+            ),
+            timeout=300,  # generous per-5MB-part timeout, unrelated to total file size
+        )
+        return {"ETag": part_response["ETag"], "PartNumber": part_number}
+
     async def _upload_large_file(self, local_path: Path, s3_key: str, md5_hash: str) -> bool:
-        """Upload large file using multipart upload for memory efficiency.
+        """Upload large file using multipart upload, with parts sent concurrently (PERF-06).
+
+        PERF-06: parts used to be uploaded strictly one at a time, each waiting on the full
+        network round-trip of the previous part — capping per-file throughput at roughly one
+        5MB chunk per round-trip regardless of actual available bandwidth. Uses a sliding
+        window (same pattern as upload_large.py's _multipart_upload) of up to
+        _MULTIPART_CONCURRENCY parts in flight at once: as soon as one completes, the next
+        chunk is read and dispatched, so memory stays bounded to concurrency × 5MB however
+        large the file is.
 
         Args:
             local_path: Path to local file
@@ -438,55 +479,57 @@ class S3Manager:
             )
             upload_id = response["UploadId"]
 
-            # Upload parts in chunks (5MB each)
             chunk_size = 5 * 1024 * 1024  # 5MB
-            parts = []
-            part_number = 1
+            completed: Dict[int, Dict[str, Any]] = {}
+            active: Dict[asyncio.Task, int] = {}
 
             try:
                 with open(local_path, "rb") as f:
-                    while True:
-                        chunk = f.read(chunk_size)
-                        if not chunk:
+                    part_number = 0
+                    eof = False
+
+                    while active or not eof:
+                        # Fill concurrency slots
+                        while not eof and len(active) < _MULTIPART_CONCURRENCY:
+                            chunk = await asyncio.to_thread(f.read, chunk_size)
+                            if not chunk:
+                                eof = True
+                                break
+                            part_number += 1
+                            task = asyncio.create_task(self._upload_part(client, s3_key, upload_id, part_number, chunk))
+                            active[task] = part_number
+
+                        if not active:
                             break
 
-                        # Upload part with timeout
-                        part_response = await asyncio.wait_for(
-                            client.upload_part(
-                                Bucket=self.config.s3_bucket,
-                                Key=s3_key,
-                                PartNumber=part_number,
-                                UploadId=upload_id,
-                                Body=chunk,
-                            ),
-                            timeout=300,  # 1 minute timeout per 5MB part
-                        )
+                        # Wait for the first part to finish, then loop to submit the next chunk
+                        done, _ = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+                        for task in done:
+                            pn = active.pop(task)
+                            completed[pn] = task.result()  # propagates exception on failure
 
-                        parts.append(
-                            {
-                                "ETag": part_response["ETag"],
-                                "PartNumber": part_number,
-                            }
-                        )
+                            if pn % 10 == 0:
+                                logger.debug(f"Uploaded {pn} parts for {local_path}")
 
-                        part_number += 1
-
-                        # Log progress for large files
-                        if part_number % 10 == 0:
-                            logger.debug(f"Uploaded {part_number - 1} parts for {local_path}")
-
-                # Complete multipart upload
+                # complete_multipart_upload requires parts in ascending PartNumber order.
+                ordered_parts = [completed[i] for i in range(1, part_number + 1)]
                 await client.complete_multipart_upload(
                     Bucket=self.config.s3_bucket,
                     Key=s3_key,
                     UploadId=upload_id,
-                    MultipartUpload={"Parts": parts},
+                    MultipartUpload={"Parts": ordered_parts},
                 )
 
                 logger.debug(f"Large file upload successful: {local_path} -> s3://{self.config.s3_bucket}/{s3_key}")
                 return True
 
             except Exception as e:
+                # Cancel any still-in-flight part tasks before aborting so their exceptions
+                # don't surface as "Task exception was never retrieved" warnings.
+                for remaining in list(active):
+                    remaining.cancel()
+                if active:
+                    await asyncio.gather(*active, return_exceptions=True)
                 # Abort multipart upload on error
                 try:
                     await client.abort_multipart_upload(

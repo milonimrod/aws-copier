@@ -451,3 +451,96 @@ class TestUploadFileUsesScaledTimeout:
         ):
             await s3.upload_file(local, "key", precomputed_md5="ignored")
             spy.assert_called_once_with(4096)
+
+
+class TestUploadLargeFileConcurrency:
+    """PERF-06: multipart parts upload concurrently (sliding window) instead of strictly serially."""
+
+    async def test_uploads_all_parts_and_completes_in_correct_order(self, s3_config, tmp_path):
+        """complete_multipart_upload's Parts list is ascending by PartNumber regardless of completion order."""
+        local = tmp_path / "big.bin"
+        local.write_bytes(b"x" * (12 * 1024 * 1024))  # 3 parts: 5MB, 5MB, 2MB
+        s3 = S3Manager(s3_config)
+        mock_client = AsyncMock()
+        mock_client.create_multipart_upload.return_value = {"UploadId": "uid-1"}
+        mock_client.complete_multipart_upload.return_value = {}
+
+        async def upload_part_side_effect(**kwargs):
+            part_number = kwargs["PartNumber"]
+            # Higher part numbers complete FIRST — completion order is the reverse of
+            # dispatch order, proving the final Parts list is fixed up regardless.
+            await asyncio.sleep(0.03 * (4 - part_number))
+            return {"ETag": f"etag-{part_number}"}
+
+        mock_client.upload_part.side_effect = upload_part_side_effect
+
+        with patch.object(s3, "_get_or_create_client", return_value=mock_client):
+            ok = await s3._upload_large_file(local, "key", "md5hash")
+
+        assert ok is True
+        assert mock_client.upload_part.call_count == 3
+        parts = mock_client.complete_multipart_upload.call_args.kwargs["MultipartUpload"]["Parts"]
+        assert [p["PartNumber"] for p in parts] == [1, 2, 3]
+        assert [p["ETag"] for p in parts] == ["etag-1", "etag-2", "etag-3"]
+
+    async def test_respects_concurrency_limit(self, s3_config, tmp_path):
+        """No more than _MULTIPART_CONCURRENCY parts are ever in flight at once, but more than 1."""
+        local = tmp_path / "big.bin"
+        local.write_bytes(b"x" * (9 * 5 * 1024 * 1024 - 1024))  # 9 parts
+        s3 = S3Manager(s3_config)
+        mock_client = AsyncMock()
+        mock_client.create_multipart_upload.return_value = {"UploadId": "uid-2"}
+        mock_client.complete_multipart_upload.return_value = {}
+
+        in_flight = 0
+        max_in_flight = 0
+        lock = asyncio.Lock()
+
+        async def upload_part_side_effect(**kwargs):
+            nonlocal in_flight, max_in_flight
+            async with lock:
+                in_flight += 1
+                max_in_flight = max(max_in_flight, in_flight)
+            await asyncio.sleep(0.02)
+            async with lock:
+                in_flight -= 1
+            return {"ETag": f"etag-{kwargs['PartNumber']}"}
+
+        mock_client.upload_part.side_effect = upload_part_side_effect
+
+        with (
+            patch.object(s3, "_get_or_create_client", return_value=mock_client),
+            patch("aws_copier.core.s3_manager._MULTIPART_CONCURRENCY", 3),
+        ):
+            ok = await s3._upload_large_file(local, "key", "md5hash")
+
+        assert ok is True
+        assert max_in_flight <= 3
+        assert max_in_flight > 1  # actually concurrent, not accidentally serialized
+
+    async def test_aborts_and_cancels_in_flight_parts_on_failure(self, s3_config, tmp_path):
+        """A failing part cancels the other in-flight parts and aborts the multipart upload."""
+        local = tmp_path / "big.bin"
+        local.write_bytes(b"x" * (12 * 1024 * 1024))  # 3 parts
+        s3 = S3Manager(s3_config)
+        mock_client = AsyncMock()
+        mock_client.create_multipart_upload.return_value = {"UploadId": "uid-3"}
+        mock_client.abort_multipart_upload.return_value = {}
+
+        async def upload_part_side_effect(**kwargs):
+            if kwargs["PartNumber"] == 2:
+                raise Exception("simulated network failure")
+            # Parts 1 and 3 stay in flight long enough to be cancelled when part 2 fails.
+            await asyncio.sleep(0.2)
+            return {"ETag": f"etag-{kwargs['PartNumber']}"}
+
+        mock_client.upload_part.side_effect = upload_part_side_effect
+
+        with patch.object(s3, "_get_or_create_client", return_value=mock_client):
+            ok = await s3._upload_large_file(local, "key", "md5hash")
+
+        assert ok is False
+        mock_client.abort_multipart_upload.assert_called_once_with(
+            Bucket="test-bucket", Key="key", UploadId="uid-3"
+        )
+        mock_client.complete_multipart_upload.assert_not_called()
