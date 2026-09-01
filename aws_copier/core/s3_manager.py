@@ -33,6 +33,14 @@ _UPLOAD_TIMEOUT_BUFFER_SECONDS = 60
 # default to for multipart uploads.
 _MULTIPART_CONCURRENCY = 8
 
+# PERF-07: 5MB is S3's *minimum* legal part size, not a natural default — every part is a
+# full HTTP request with its own signing/round-trip overhead, so with any real network
+# latency between client and S3, smaller parts mean that fixed per-request cost dominates a
+# larger share of total time. 16MB (s3transfer/AWS CLI-scale territory) cuts the number of
+# requests for a given file size by more than 3x while keeping peak memory for one file's
+# in-flight parts modest (_MULTIPART_CONCURRENCY x this = 128MB).
+_MULTIPART_CHUNK_SIZE = 16 * 1024 * 1024
+
 
 def estimate_upload_timeout(file_size: int) -> int:
     """Scale an upload timeout with file size so large files aren't cut off mid-transfer.
@@ -444,7 +452,7 @@ class S3Manager:
                 UploadId=upload_id,
                 Body=chunk,
             ),
-            timeout=300,  # generous per-5MB-part timeout, unrelated to total file size
+            timeout=300,  # generous per-part timeout (fixed part size), unrelated to total file size
         )
         return {"ETag": part_response["ETag"], "PartNumber": part_number}
 
@@ -453,11 +461,16 @@ class S3Manager:
 
         PERF-06: parts used to be uploaded strictly one at a time, each waiting on the full
         network round-trip of the previous part — capping per-file throughput at roughly one
-        5MB chunk per round-trip regardless of actual available bandwidth. Uses a sliding
-        window (same pattern as upload_large.py's _multipart_upload) of up to
-        _MULTIPART_CONCURRENCY parts in flight at once: as soon as one completes, the next
-        chunk is read and dispatched, so memory stays bounded to concurrency × 5MB however
+        chunk per round-trip regardless of actual available bandwidth. Uses a sliding window
+        (same pattern as upload_large.py's _multipart_upload) of up to _MULTIPART_CONCURRENCY
+        parts in flight at once: as soon as one completes, the next chunk is read and
+        dispatched, so memory stays bounded to concurrency × _MULTIPART_CHUNK_SIZE however
         large the file is.
+
+        PERF-07: parts are _MULTIPART_CHUNK_SIZE (16MB) rather than S3's 5MB minimum — each
+        part is a full HTTP request with its own signing/round-trip overhead, so with any
+        real network latency, larger parts mean fewer requests per file and less time spent
+        on fixed per-request cost relative to actual data transfer.
 
         Args:
             local_path: Path to local file
@@ -479,7 +492,7 @@ class S3Manager:
             )
             upload_id = response["UploadId"]
 
-            chunk_size = 5 * 1024 * 1024  # 5MB
+            chunk_size = _MULTIPART_CHUNK_SIZE
             completed: Dict[int, Dict[str, Any]] = {}
             active: Dict[asyncio.Task, int] = {}
 

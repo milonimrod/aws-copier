@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from aws_copier.core.s3_manager import S3Manager, estimate_upload_timeout
+from aws_copier.core.s3_manager import S3Manager, estimate_upload_timeout, _MULTIPART_CHUNK_SIZE
 from aws_copier.models.simple_config import SimpleConfig
 
 
@@ -459,7 +459,7 @@ class TestUploadLargeFileConcurrency:
     async def test_uploads_all_parts_and_completes_in_correct_order(self, s3_config, tmp_path):
         """complete_multipart_upload's Parts list is ascending by PartNumber regardless of completion order."""
         local = tmp_path / "big.bin"
-        local.write_bytes(b"x" * (12 * 1024 * 1024))  # 3 parts: 5MB, 5MB, 2MB
+        local.write_bytes(b"x" * (2 * _MULTIPART_CHUNK_SIZE + 1024))  # 3 parts: full, full, remainder
         s3 = S3Manager(s3_config)
         mock_client = AsyncMock()
         mock_client.create_multipart_upload.return_value = {"UploadId": "uid-1"}
@@ -486,7 +486,7 @@ class TestUploadLargeFileConcurrency:
     async def test_respects_concurrency_limit(self, s3_config, tmp_path):
         """No more than _MULTIPART_CONCURRENCY parts are ever in flight at once, but more than 1."""
         local = tmp_path / "big.bin"
-        local.write_bytes(b"x" * (9 * 5 * 1024 * 1024 - 1024))  # 9 parts
+        local.write_bytes(b"x" * (9 * _MULTIPART_CHUNK_SIZE - 1024))  # 9 parts
         s3 = S3Manager(s3_config)
         mock_client = AsyncMock()
         mock_client.create_multipart_upload.return_value = {"UploadId": "uid-2"}
@@ -521,7 +521,7 @@ class TestUploadLargeFileConcurrency:
     async def test_aborts_and_cancels_in_flight_parts_on_failure(self, s3_config, tmp_path):
         """A failing part cancels the other in-flight parts and aborts the multipart upload."""
         local = tmp_path / "big.bin"
-        local.write_bytes(b"x" * (12 * 1024 * 1024))  # 3 parts
+        local.write_bytes(b"x" * (2 * _MULTIPART_CHUNK_SIZE + 1024))  # 3 parts
         s3 = S3Manager(s3_config)
         mock_client = AsyncMock()
         mock_client.create_multipart_upload.return_value = {"UploadId": "uid-3"}
