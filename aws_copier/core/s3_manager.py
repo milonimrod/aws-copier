@@ -340,7 +340,13 @@ class S3Manager:
             return False
 
     async def _calculate_md5(self, file_path: Path) -> Optional[str]:
-        """Calculate MD5 hash of a file using async I/O.
+        """Calculate MD5 hash of a file, offloaded to a thread pool.
+
+        PERF-08: hashlib.file_digest() (3.11+) reads via a reused bytearray buffer
+        (readinto) instead of allocating a new bytes object per chunk. Only used as a
+        fallback when upload_file() isn't given a precomputed_md5 (PERF-03) — the normal
+        FileListener path always passes one, computed via file_listener.py's own
+        _calculate_md5, so this rarely runs in practice.
 
         Args:
             file_path: Path to file
@@ -349,14 +355,10 @@ class S3Manager:
             MD5 hash as hex string, or None if error
         """
         try:
-            hasher = hashlib.md5()
 
-            # Use asyncio to run in thread pool for file I/O
-            def _hash_file():
+            def _hash_file() -> str:
                 with open(file_path, "rb") as f:
-                    while chunk := f.read(8192):
-                        hasher.update(chunk)
-                return hasher.hexdigest()
+                    return hashlib.file_digest(f, "md5").hexdigest()
 
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(None, _hash_file)

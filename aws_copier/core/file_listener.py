@@ -878,6 +878,10 @@ class FileListener:
     def _calculate_md5_sync(self, file_path: Path) -> Optional[str]:
         """Synchronous MD5 computation for use inside asyncio.to_thread.
 
+        PERF-08: hashlib.file_digest() (3.11+) reads via a reused bytearray buffer
+        (readinto) instead of allocating a new bytes object per chunk, avoiding the
+        manual read-loop's per-iteration allocation overhead.
+
         Args:
             file_path: Path to file
 
@@ -885,11 +889,8 @@ class FileListener:
             MD5 hash as hex string, or None if error
         """
         try:
-            hasher = hashlib.md5()
             with open(file_path, "rb") as f:
-                for chunk in iter(lambda: f.read(1048576), b""):
-                    hasher.update(chunk)
-            return hasher.hexdigest()
+                return hashlib.file_digest(f, "md5").hexdigest()
         except Exception as e:
             logger.error(f"Error calculating MD5 for {file_path}: {e}")
             return None
@@ -898,8 +899,7 @@ class FileListener:
         """Calculate MD5 hash of a file by offloading to a thread pool.
 
         hashlib releases the GIL during C-level hashing, so multiple threads
-        can genuinely parallelize. 1MB chunks minimise per-chunk overhead vs
-        the old 8192-byte aiofiles loop.
+        can genuinely parallelize.
 
         Args:
             file_path: Path to file
