@@ -17,6 +17,31 @@ from aws_copier.models.simple_config import SimpleConfig
 
 logger = logging.getLogger(__name__)
 
+# PERF-05: a fixed 300s upload timeout is fine for typical photos/documents but cuts off
+# large video files on a slow/congested uplink well before they can finish. 1MB/s is a
+# conservative throughput floor — genuinely slower than that should time out rather than
+# hang indefinitely — and 300s stays the floor so small-file behavior is unchanged.
+_MIN_ASSUMED_UPLOAD_BYTES_PER_SEC = 1024 * 1024
+_UPLOAD_TIMEOUT_FLOOR_SECONDS = 300
+_UPLOAD_TIMEOUT_BUFFER_SECONDS = 60
+
+
+def estimate_upload_timeout(file_size: int) -> int:
+    """Scale an upload timeout with file size so large files aren't cut off mid-transfer.
+
+    Shared by S3Manager (bounds the actual put_object/copy call) and FileListener (bounds
+    the whole MD5 + check_exists + upload sequence for one file) so both layers agree on
+    how long a given file is allowed to take.
+
+    Args:
+        file_size: Size of the file being uploaded, in bytes.
+
+    Returns:
+        Timeout in seconds — never less than the 300s floor used before this existed.
+    """
+    scaled = file_size // _MIN_ASSUMED_UPLOAD_BYTES_PER_SEC + _UPLOAD_TIMEOUT_BUFFER_SECONDS
+    return max(_UPLOAD_TIMEOUT_FLOOR_SECONDS, scaled)
+
 
 class S3Manager:
     """Truly async S3 manager with upload and existence checking (following production pattern)."""
@@ -227,7 +252,9 @@ class S3Manager:
 
             # Use file object directly instead of reading all into memory
             with open(local_path, "rb") as f:
-                # Add timeout to prevent hanging uploads
+                # PERF-05: timeout scales with file size (see estimate_upload_timeout)
+                # instead of a fixed 300s, so larger single-part uploads on a slow
+                # connection aren't cut off before they can finish.
                 await asyncio.wait_for(
                     client.put_object(
                         Bucket=self.config.s3_bucket,
@@ -235,7 +262,7 @@ class S3Manager:
                         Body=f,
                         Metadata=metadata,
                     ),
-                    timeout=300,
+                    timeout=estimate_upload_timeout(file_size),
                 )
 
             # Verify upload by checking MD5

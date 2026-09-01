@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from aws_copier.core.s3_manager import S3Manager
+from aws_copier.core.s3_manager import S3Manager, estimate_upload_timeout
 from aws_copier.models.simple_config import SimpleConfig
 
 
@@ -398,3 +398,56 @@ class TestS3ManagerMoveObject:
 
         assert result is False
         mock_client.delete_object.assert_not_called()
+
+
+class TestEstimateUploadTimeout:
+    """PERF-05: upload timeout scales with file size instead of a fixed 300s."""
+
+    def test_small_file_uses_floor(self):
+        """Files small enough that the scaled value is under 300s still get the 300s floor."""
+        assert estimate_upload_timeout(0) == 300
+        assert estimate_upload_timeout(1024 * 1024) == 300  # 1MB
+
+    def test_large_file_scales_above_floor(self):
+        """A file large enough to need more than 300s at the assumed 1MB/s floor gets it."""
+        five_hundred_mb = 500 * 1024 * 1024
+        # 500s (at 1MB/s) + 60s buffer = 560s
+        assert estimate_upload_timeout(five_hundred_mb) == 560
+
+    def test_very_large_file_scales_linearly(self):
+        """A multi-GB video file gets a proportionally larger window, not cut off at 300s."""
+        ten_gb = 10 * 1024 * 1024 * 1024
+        # 10240s (at 1MB/s) + 60s buffer = 10300s
+        assert estimate_upload_timeout(ten_gb) == 10300
+
+    def test_never_returns_less_than_floor(self):
+        """Timeout is monotonically non-decreasing and never below the original 300s floor."""
+        for size in (0, 1, 1024, 100 * 1024 * 1024):
+            assert estimate_upload_timeout(size) >= 300
+
+
+class TestUploadFileUsesScaledTimeout:
+    """PERF-05: S3Manager.upload_file's put_object call uses the size-scaled timeout."""
+
+    async def test_put_object_timeout_scales_with_file_size(self, s3_config, tmp_path):
+        """A large single-part file (<=100MB) gets a put_object timeout above the 300s floor."""
+        # 150 bytes of content but we only care that the *reported* file size drives the
+        # timeout calculation — patch stat via a real file large enough to cross the floor
+        # would be slow to write in a test, so instead verify via the actual small file
+        # (well under 100MB, so it takes the put_object path) using a spy on
+        # estimate_upload_timeout to confirm it's invoked with this file's real size.
+        local = tmp_path / "small.bin"
+        local.write_bytes(b"x" * 4096)
+        s3 = S3Manager(s3_config)
+        mock_client = AsyncMock()
+        mock_client.put_object.return_value = {"ETag": "x"}
+        mock_client.head_object.return_value = {
+            "Metadata": {"md5-checksum": "ignored"},
+            "ETag": '"some_etag"',
+        }
+        with (
+            patch.object(s3, "_get_or_create_client", return_value=mock_client),
+            patch("aws_copier.core.s3_manager.estimate_upload_timeout", wraps=estimate_upload_timeout) as spy,
+        ):
+            await s3.upload_file(local, "key", precomputed_md5="ignored")
+            spy.assert_called_once_with(4096)

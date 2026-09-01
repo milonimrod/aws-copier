@@ -16,7 +16,7 @@ from tqdm import tqdm as sync_tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 from aws_copier.core.ignore_rules import IGNORE_RULES
-from aws_copier.core.s3_manager import S3Manager
+from aws_copier.core.s3_manager import S3Manager, estimate_upload_timeout
 from aws_copier.models.simple_config import SimpleConfig
 
 logger = logging.getLogger(__name__)
@@ -588,12 +588,18 @@ class FileListener:
                 return False, 0.0
 
     async def _upload_with_timeout(self, filename: str, folder_path: Path) -> Tuple[str, bool, float]:
-        """Wrap a single upload in asyncio.wait_for so the 300s window belongs to the coroutine, not the task.
+        """Wrap a single upload in asyncio.wait_for so the timeout window belongs to the coroutine, not the task.
 
         ASYNC-02 Pitfall 1 fix: when wait_for was applied to an already-created task
         inside a serial for-loop, the N-th file's timeout window began only after the
         (N-1)-th completed or timed out. Wrapping the coroutine BEFORE create_task ensures
-        each file gets its own independent 300s window running concurrently.
+        each file gets its own independent timeout window running concurrently.
+
+        PERF-05: the window scales with this file's size (estimate_upload_timeout) instead
+        of a fixed 300s. This is the binding bound for large (>100MB, multipart) files —
+        S3Manager only times out individual 5MB parts, not the multipart upload as a whole
+        — so a large video file on a slow connection needs this outer window sized to its
+        total bytes, not just S3Manager's per-part window.
 
         Args:
             filename: Name of file to upload
@@ -604,10 +610,15 @@ class FileListener:
             captured just before upload (D-02). On failure, upload_mtime is 0.0.
         """
         try:
-            ok, upload_mtime = await asyncio.wait_for(self._upload_single_file(filename, folder_path), timeout=300)
+            file_size = (folder_path / filename).stat().st_size
+        except OSError:
+            file_size = 0
+        timeout = estimate_upload_timeout(file_size)
+        try:
+            ok, upload_mtime = await asyncio.wait_for(self._upload_single_file(filename, folder_path), timeout=timeout)
             return filename, bool(ok), upload_mtime
         except asyncio.TimeoutError:
-            logger.error(f"Upload timeout for {filename} (5 minutes)")
+            logger.error(f"Upload timeout for {filename} ({timeout}s, {file_size / (1024 * 1024):.1f}MB)")
             self._stats["errors"] += 1
             return filename, False, 0.0
         except Exception as e:

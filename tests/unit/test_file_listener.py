@@ -7,11 +7,12 @@ import asyncio
 import json
 import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from aws_copier.core.file_listener import FileListener
+from aws_copier.core.s3_manager import estimate_upload_timeout
 from aws_copier.models.simple_config import SimpleConfig
 
 
@@ -365,6 +366,25 @@ class TestFileListenerUploads:
 
         # Verify S3Manager was called
         assert file_listener.s3_manager.upload_file.call_count == 2
+
+    async def test_upload_with_timeout_scales_with_file_size(self, file_listener, temp_watch_folder):
+        """PERF-05: the per-file timeout window is computed from that file's actual size."""
+        with patch(
+            "aws_copier.core.file_listener.estimate_upload_timeout", wraps=estimate_upload_timeout
+        ) as spy:
+            await file_listener._upload_with_timeout("file1.txt", temp_watch_folder)
+
+        expected_size = (temp_watch_folder / "file1.txt").stat().st_size
+        spy.assert_called_once_with(expected_size)
+
+    async def test_upload_with_timeout_missing_file_uses_floor(self, file_listener, temp_watch_folder):
+        """A file that can't be stat'd (e.g. deleted mid-scan) falls back to size 0 (floor timeout)."""
+        with patch(
+            "aws_copier.core.file_listener.estimate_upload_timeout", wraps=estimate_upload_timeout
+        ) as spy:
+            await file_listener._upload_with_timeout("does_not_exist.txt", temp_watch_folder)
+
+        spy.assert_called_once_with(0)
 
     async def test_upload_files_with_s3_check_skip(self, file_listener, temp_watch_folder):
         """Test upload with S3 existence check - files already exist in S3."""
