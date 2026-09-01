@@ -58,8 +58,12 @@ class FileChangeHandler(FileSystemEventHandler):
 
             file_path = Path(event.src_path)
 
-            # Skip if file should be ignored (IGNORE-03: delegate to canonical IGNORE_RULES singleton)
-            if IGNORE_RULES.should_ignore_file(file_path):
+            # Skip if file (or any ancestor directory under watch_folder) should be ignored.
+            # WATCH-01: should_ignore_path also catches files inside an ignored directory
+            # (e.g. another tool's .sync/ bookkeeping folder) — should_ignore_file alone only
+            # checks the filename itself, which a batch scan's should_ignore_dir recursion
+            # guard would have caught but a raw watchdog event does not.
+            if IGNORE_RULES.should_ignore_path(file_path, self.watch_folder):
                 return
 
             # Skip if file doesn't exist (might have been deleted quickly)

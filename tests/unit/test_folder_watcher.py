@@ -251,6 +251,23 @@ class TestFileChangeHandler:
 
         assert mock_run.call_count == 0
 
+    def test_on_any_event_skips_file_inside_ignored_ancestor_dir(self, file_change_handler, temp_watch_folder):
+        """WATCH-01 regression: a file whose OWN name is fine but lives inside a dot-prefixed
+        (or otherwise ignored) directory must still be skipped — should_ignore_file alone
+        (checking only the filename) would have missed this; should_ignore_path checks the
+        full ancestor chain under watch_folder.
+        """
+        sync_dir = temp_watch_folder / ".sync" / "pictures_pictures"
+        sync_dir.mkdir(parents=True)
+        db_file = sync_dir / "bisync.db"
+        db_file.write_text("not actually ignored by filename alone")
+        event = FileCreatedEvent(str(db_file))
+
+        with patch("aws_copier.core.folder_watcher.asyncio.run_coroutine_threadsafe") as mock_run:
+            file_change_handler.on_any_event(event)
+
+        assert mock_run.call_count == 0
+
     def test_on_any_event_file_modified(self, file_change_handler, temp_watch_folder):
         """Test handling file modified events."""
         test_file = temp_watch_folder / "file1.txt"

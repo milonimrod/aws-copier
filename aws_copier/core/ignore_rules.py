@@ -143,6 +143,34 @@ class IgnoreRules:
             return True
         return False
 
+    def should_ignore_path(self, path: Path, root: Path) -> bool:
+        """Return True if `path` itself, or any directory between `root` and `path`, is ignored.
+
+        WATCH-01: should_ignore_file only inspects the file's own name — a real-time
+        watchdog event for a file inside an ignored directory (e.g. some other tool's
+        `.sync/` bookkeeping folder) was never being filtered, because the scanner's
+        should_ignore_dir check only runs during the batch recursive walk, not on
+        individual filesystem events. This checks the full ancestor chain by name (cheap —
+        no extra stat/symlink calls), matching what a batch scan would have skipped had it
+        recursed into `path`'s directory.
+
+        Args:
+            path: File path to check (from a watchdog event or similar)
+            root: Ancestor boundary — only directories between root and path are checked;
+                root itself is not checked (a configured watch folder is never ignored)
+
+        Returns:
+            True if path's filename is ignored, or if any ancestor directory name between
+            root and path matches ignore_dirs or starts with a dot.
+        """
+        if self.should_ignore_file(path):
+            return True
+        try:
+            ancestor_names = path.relative_to(root).parts[:-1]
+        except ValueError:
+            ancestor_names = ()
+        return any(name in self.ignore_dirs or name.startswith(".") for name in ancestor_names)
+
 
 # Module-level singleton — import this, do not instantiate IgnoreRules directly.
 IGNORE_RULES: IgnoreRules = IgnoreRules()
