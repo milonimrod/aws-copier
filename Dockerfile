@@ -19,6 +19,7 @@ RUN uv sync --frozen --no-install-project --no-dev
 
 COPY aws_copier/ ./aws_copier/
 COPY main.py ./
+COPY find_duplicates.py ./
 
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
