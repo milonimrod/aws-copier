@@ -90,17 +90,34 @@ class FileChangeHandler(FileSystemEventHandler):
         2-second timer. Dict access is safe — this coroutine always runs in the
         asyncio event loop thread (scheduled via run_coroutine_threadsafe).
 
+        PERF-09: keyed by file_path's PARENT FOLDER, not the file path itself.
+        _process_current_folder always processes the whole folder regardless of which
+        file triggered it, so multiple files landing in the same folder within the
+        debounce window must collapse into one pass — not one pass per file. Before this,
+        copying N files into one folder at once fired N independent debounce timers, each
+        starting its own _process_current_folder call for the same folder. Since
+        _folder_locks only guards the individual backup-info load/write steps (not the
+        whole scan+upload pipeline), those N calls could genuinely interleave and each
+        independently re-upload the same files — not just redundant rescans, real
+        duplicated uploads (observed live: 6 files copied in produced 6 separate "6
+        uploaded" log lines for the same folder instead of 1). Keying by folder means the
+        Nth file's event cancels the (N-1)th's still-pending timer, so only the last
+        arrival's timer survives — when it fires 2s later, the single resulting
+        _process_current_folder call picks up all N files' changes in one pass, since
+        they're all already on disk by then regardless of whose timer triggered it.
+
         Args:
             file_path: Path that triggered the file system event
             event_type: watchdog event type string (created, modified, etc.)
         """
-        key = str(file_path)
+        folder_path = file_path.parent
+        key = str(folder_path)
         existing = self._debounce_tasks.get(key)
         if existing is not None and not existing.done():
             existing.cancel()
         task = asyncio.create_task(
             self._debounced_process(file_path, event_type),
-            name=f"debounce-{file_path.name}",
+            name=f"debounce-{folder_path.name}",
         )
         self._debounce_tasks[key] = task
 

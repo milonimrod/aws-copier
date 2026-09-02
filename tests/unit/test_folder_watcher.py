@@ -523,32 +523,58 @@ class TestEventDebounce:
         await asyncio.sleep(2.3)
         debounce_handler.file_listener._process_current_folder.assert_called_once()
 
-    async def test_distinct_paths_debounce_independently(self, debounce_handler, temp_watch_folder):
-        """Two distinct paths each get their own debounce task; both fire after 2 seconds."""
+    async def test_files_in_different_folders_debounce_independently(self, debounce_handler, temp_watch_folder):
+        """Two files in DIFFERENT folders each get their own debounce task; both fire after 2 seconds."""
         file_a = temp_watch_folder / "a.txt"
-        file_b = temp_watch_folder / "b.txt"
+        file_b = temp_watch_folder / "subdir" / "b.txt"
         file_a.write_text("a")
         file_b.write_text("b")
         await debounce_handler._schedule_debounced(file_a, "modified")
         await debounce_handler._schedule_debounced(file_b, "modified")
-        # Two pending tasks expected
+        # Two pending tasks expected — different parent folders, different keys
         pending = [t for t in debounce_handler._debounce_tasks.values() if not t.done()]
         assert len(pending) == 2
         await asyncio.sleep(2.3)
         assert debounce_handler.file_listener._process_current_folder.call_count == 2
 
+    async def test_multiple_files_in_same_folder_collapse_to_one_call(self, debounce_handler, temp_watch_folder):
+        """PERF-09 regression: several files landing in the SAME folder within the debounce
+        window must produce exactly one _process_current_folder call, not one per file —
+        the real bug this fixed: copying N files into one folder fired N independent
+        overlapping calls for the same folder, each redundantly (and, since the per-folder
+        lock only guards individual backup-info I/O, not the whole pipeline) duplicately
+        re-uploading the same files.
+        """
+        file_a = temp_watch_folder / "a.txt"
+        file_b = temp_watch_folder / "b.txt"
+        file_c = temp_watch_folder / "c.txt"
+        file_a.write_text("a")
+        file_b.write_text("b")
+        file_c.write_text("c")
+
+        await debounce_handler._schedule_debounced(file_a, "modified")
+        await debounce_handler._schedule_debounced(file_b, "modified")
+        await debounce_handler._schedule_debounced(file_c, "modified")
+
+        # Only one pending task for the shared folder — the earlier two were cancelled.
+        pending = [t for t in debounce_handler._debounce_tasks.values() if not t.done()]
+        assert len(pending) == 1
+
+        await asyncio.sleep(2.3)
+        debounce_handler.file_listener._process_current_folder.assert_called_once_with(temp_watch_folder)
+
     async def test_new_event_cancels_previous(self, debounce_handler, temp_watch_folder):
-        """A second event for the same path cancels the first debounce task and creates a new one."""
+        """A second event for the same folder cancels the first debounce task and creates a new one."""
         file_path = temp_watch_folder / "f.txt"
         file_path.write_text("x")
         await debounce_handler._schedule_debounced(file_path, "modified")
-        first_task = debounce_handler._debounce_tasks[str(file_path)]
+        first_task = debounce_handler._debounce_tasks[str(temp_watch_folder)]
         await debounce_handler._schedule_debounced(file_path, "modified")
         # Allow the cancellation to actually fire
         await asyncio.sleep(0.05)
         assert first_task.cancelled() or first_task.done()
         # And the dict now points at a different task
-        assert debounce_handler._debounce_tasks[str(file_path)] is not first_task
+        assert debounce_handler._debounce_tasks[str(temp_watch_folder)] is not first_task
 
     async def test_cancelled_error_silenced(self, debounce_handler, temp_watch_folder, caplog):
         """CancelledError from a cancelled debounce task must not produce ERROR-level log entries."""
