@@ -174,14 +174,34 @@ class TestReportDuplicateFolders:
         assert count == 0
 
 
-class TestMainConfigPathHandling:
-    """Regression: a missing config.yaml must error out, not silently create a template
-    with bogus watch_folders and proceed against the wrong (empty) library — the same bug
-    class fixed earlier in main.py's AWSCopierApp."""
+class TestMainArgumentHandling:
+    """main() takes plain folder paths and never requires config.yaml — the tool only
+    reads .milo_backup.info files, it never touches S3 or credentials. --config is an
+    optional convenience for reusing an existing config.yaml's watch_folders."""
+
+    def test_no_paths_and_no_config_exits_with_error(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("sys.argv", ["find_duplicates.py"])
+
+        with pytest.raises(SystemExit) as exc_info:
+            find_duplicates.main()
+
+        assert "pass at least one PATH" in str(exc_info.value)
+
+    def test_paths_and_config_together_is_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["find_duplicates.py", str(tmp_path), "--config", "config.yaml"])
+
+        with pytest.raises(SystemExit) as exc_info:
+            find_duplicates.main()
+
+        assert "either PATH arguments or --config" in str(exc_info.value)
 
     def test_missing_config_exits_with_error(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)  # no config.yaml here
-        monkeypatch.setattr("sys.argv", ["find_duplicates.py"])
+        """Regression: a missing --config must error out, not silently create a template
+        with bogus watch_folders and proceed against the wrong (empty) library — the same
+        bug class fixed earlier in main.py's AWSCopierApp."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("sys.argv", ["find_duplicates.py", "--config", "config.yaml"])
 
         with pytest.raises(SystemExit) as exc_info:
             find_duplicates.main()
@@ -190,17 +210,10 @@ class TestMainConfigPathHandling:
         # And critically: no template config.yaml was silently created as a side effect.
         assert not (tmp_path / "config.yaml").exists()
 
-    def test_default_config_path_is_relative_not_home_based(self, tmp_path, monkeypatch):
-        """The default --config must be config.yaml in the cwd, matching where the daemon
-        expects it (e.g. /app/config.yaml in the container) — not
-        DEFAULT_CONFIG_PATH/~/aws-copier-config.yaml, which `docker exec` (running as
-        root, $HOME=/root) would silently miss.
-        """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr("sys.argv", ["find_duplicates.py"])
+    def test_explicit_path_scans_without_any_config(self, tmp_path, monkeypatch, capsys):
+        _write_backup_info(tmp_path / "album", {"photo.jpg": "aaa111"})
+        monkeypatch.setattr("sys.argv", ["find_duplicates.py", str(tmp_path)])
 
-        with pytest.raises(SystemExit) as exc_info:
-            find_duplicates.main()
+        find_duplicates.main()
 
-        # Relative "config.yaml" (resolved against cwd), not an absolute ~/aws-copier-config.yaml.
-        assert str(exc_info.value) == "Error: config not found at config.yaml"
+        assert "No duplicate files found" in capsys.readouterr().out

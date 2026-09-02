@@ -1,14 +1,14 @@
 """Standalone tool: find duplicate files and folders across watched libraries by reusing
 MD5 checksums already recorded in .milo_backup.info — no re-hashing needed.
 
-Must be run somewhere the config's watch_folders paths actually resolve. Since
-config.yaml's watch_folders are container paths (e.g. /data/pictures), the normal way to
-run this is inside the running container:
+Takes plain folder paths — it never touches S3 or credentials, so config.yaml isn't
+required. Must be run somewhere those paths actually resolve. Since the daemon's
+watch_folders are container paths (e.g. /data/pictures), the normal way to run this is
+inside the running container:
 
-    docker exec aws-copier python find_duplicates.py
+    docker exec aws-copier python find_duplicates.py /data/pictures
 
-Running it locally instead needs a config.yaml whose watch_folders match paths this
-machine can actually see.
+Pass --config instead of explicit paths to reuse an existing config.yaml's watch_folders.
 """
 
 import argparse
@@ -21,8 +21,6 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
-
-from aws_copier.models.simple_config import SimpleConfig, load_config
 
 logger = logging.getLogger(__name__)
 
@@ -194,20 +192,25 @@ def _parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  docker exec aws-copier python find_duplicates.py
-  docker exec aws-copier python find_duplicates.py --min-size 1048576
-  uv run python find_duplicates.py --config ~/my-config.yaml --keep-db
+  docker exec aws-copier python find_duplicates.py /data/pictures
+  docker exec aws-copier python find_duplicates.py /data/pictures --min-size 1048576
+  uv run python find_duplicates.py --config config.yaml --keep-db
 """,
+    )
+    parser.add_argument(
+        "paths",
+        type=Path,
+        nargs="*",
+        metavar="PATH",
+        help="Folder(s) to scan for .milo_backup.info files. Mutually exclusive with --config.",
     )
     parser.add_argument(
         "--config",
         type=Path,
         default=None,
         metavar="PATH",
-        help="Config YAML path (default: config.yaml in the working directory — matches "
-        "where the daemon expects it, e.g. /app/config.yaml inside the container; NOT "
-        "DEFAULT_CONFIG_PATH/~/aws-copier-config.yaml, which `docker exec` — running as "
-        "root, $HOME=/root — would silently miss)",
+        help="Load folders to scan from a config.yaml's watch_folders instead of passing "
+        "PATH arguments directly. Only useful if you'd rather not type the paths out.",
     )
     parser.add_argument(
         "--min-size",
@@ -242,24 +245,34 @@ def main() -> None:
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
 
-    config_path = args.config or Path("config.yaml")
-    # NOTE: load_config() never raises FileNotFoundError for a missing path — it silently
-    # creates a template config there instead (with bogus default watch_folders) and
-    # returns that. Must check existence explicitly first, or a missing/wrong config_path
-    # silently "succeeds" against the wrong (empty) library instead of erroring out.
-    if not config_path.exists():
-        sys.exit(f"Error: config not found at {config_path}")
-    config: SimpleConfig = load_config(config_path)
+    if args.paths and args.config:
+        sys.exit("Error: pass either PATH arguments or --config, not both")
+
+    if args.config:
+        # NOTE: load_config() never raises FileNotFoundError for a missing path — it
+        # silently creates a template config there instead (with bogus default
+        # watch_folders) and returns that. Must check existence explicitly first, or a
+        # missing/wrong --config path silently "succeeds" against the wrong (empty)
+        # library instead of erroring out.
+        if not args.config.exists():
+            sys.exit(f"Error: config not found at {args.config}")
+        from aws_copier.models.simple_config import load_config
+
+        watch_folders = load_config(args.config).watch_folders
+    elif args.paths:
+        watch_folders = args.paths
+    else:
+        sys.exit("Error: pass at least one PATH to scan, or --config to reuse a config.yaml")
 
     print("AWS Copier — Duplicate Finder")
-    print(f"Watch folders: {', '.join(str(f) for f in config.watch_folders)}")
+    print(f"Watch folders: {', '.join(str(f) for f in watch_folders)}")
 
     db_fd, db_path_str = tempfile.mkstemp(suffix=".sqlite", prefix="aws-copier-dupes-")
     os.close(db_fd)
     db_path = Path(db_path_str)
 
     try:
-        conn = build_index(db_path, config.watch_folders)
+        conn = build_index(db_path, watch_folders)
         try:
             if not args.folders_only:
                 report_duplicate_files(conn, args.min_size)
