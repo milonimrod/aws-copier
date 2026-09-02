@@ -102,6 +102,8 @@ docker compose up -d   # no --build — uses the image just loaded
   independently, only when they've actually changed.
 - Does not restart cleanly mid-scan without cost: recreating the container restarts
   `scan_all_folders()` from the top. Already-synced folders skip fast (mtime cache in
-  `.milo_backup.info`), but for a large library this still means the real-time watcher
-  (which only starts after the full scan completes) is unavailable again for a while after
-  every redeploy. See the `aws-copier-monitoring` skill for how to check scan progress.
+  `.milo_backup.info`), so this is usually quick unless a lot of new content needs
+  uploading. There's no real-time watcher anymore (see `aws-copier-architecture`) — the app
+  only syncs during a scan (startup, or the periodic rescan every `FULL_RESCAN_INTERVAL_SECONDS`,
+  default 6h) — so files added between scans just wait for the next one, redeploy or not.
+  See the `aws-copier-monitoring` skill for how to check scan progress.

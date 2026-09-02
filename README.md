@@ -1,11 +1,12 @@
 # AWS Copier
 
-A cross-platform daemon for real-time folder synchronization to AWS S3 with file integrity verification.
+A cross-platform daemon for periodic incremental folder synchronization to AWS S3 with file integrity verification.
 
 ## Features
 
 - **Incremental Backup**: Smart `.milo_backup.info` tracking to only upload changed files
-- **Real-time Monitoring**: Watches folders for changes and uploads immediately
+- **Periodic Full Rescan**: Re-scans every watch folder on a fixed interval (default 6h) —
+  the sole sync mechanism (no real-time file watcher — see Architecture below for why)
 - **Concurrent Uploads**: Up to 100 parallel uploads for maximum performance
 - **File Integrity**: MD5 checksum verification for all uploads
 - **Cross-platform**: Works on Windows, macOS, and Linux
@@ -131,6 +132,15 @@ uv run pytest tests/unit/ -v
 ## Architecture
 
 - **FileListener**: Performs incremental backup scans using `.milo_backup.info` files
-- **FolderWatcher**: Real-time file system monitoring
 - **S3Manager**: Async S3 operations with connection pooling
 - **SimpleConfig**: YAML-based configuration management
+
+No real-time file watcher — periodic full scans (`FULL_RESCAN_INTERVAL_SECONDS` in
+`main.py`, default 6h) are the sole sync mechanism. An earlier version used a
+`watchdog`-based real-time watcher; it was removed after two real production bugs turned up
+in that subsystem specifically (duplicate uploads from per-file debounce keying, and files
+inside ignored directories slipping through undetected), plus a standing risk that heavy
+background filesystem churn (e.g. a NAS-bundled cloud-sync tool) could overflow the OS's
+`inotify` event queue and silently drop events. For a personal backup tool, bounded
+scan-interval latency was judged a better tradeoff than an entire watcher subsystem's worth
+of edge cases.

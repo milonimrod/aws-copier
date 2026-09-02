@@ -42,7 +42,6 @@
 
 **Critical:**
 - `aiobotocore` >=2.24.1 - Truly async AWS SDK wrapper around botocore; used in `aws_copier/core/s3_manager.py` for all S3 operations
-- `watchdog` >=3.0.0 - Cross-platform file system event monitoring; used in `aws_copier/core/folder_watcher.py` via `Observer` and `FileSystemEventHandler`
 - `pyyaml` >=6.0.2 - YAML config parsing/writing in `aws_copier/models/simple_config.py`
 - `aiofiles` >=24.1.0 - Async file I/O for MD5 computation in `aws_copier/core/file_listener.py`
 - `python-dotenv` >=1.1.1 - `.env` loading in the `s3_manager.py` `main()` test harness

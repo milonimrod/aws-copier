@@ -6,11 +6,11 @@ import sys
 import os
 import signal
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 
 from aws_copier.core.file_listener import FileListener
-from aws_copier.core.folder_watcher import FolderWatcher
 from aws_copier.core.s3_manager import S3Manager
 from aws_copier.models.simple_config import SimpleConfig, load_config
 from aws_copier.ui.simple_gui import create_gui
@@ -29,7 +29,6 @@ class AWSCopierGUIApp:
         self.s3_manager = S3Manager(self.config)
         # Incremental backup components
         self.file_listener = FileListener(self.config, self.s3_manager)
-        self.folder_watcher = FolderWatcher(self.config, self.file_listener)  # Real-time monitoring
         self.running = False
         self.shutdown_event = None
 
@@ -115,15 +114,12 @@ class AWSCopierGUIApp:
             # Perform initial scan
             logger.info("Starting initial folder scan...")
             await self.file_listener.scan_all_folders()
+            last_scan_monotonic = time.monotonic()
             logger.info("Initial scan completed")
 
-            # Start folder watcher for real-time monitoring
-            logger.info("Starting folder watcher...")
-            await self.folder_watcher.start()
-            logger.info("Folder watcher started")
-
-            # Main loop - wait for shutdown signal
-            logger.info("AWS Copier is running. Monitoring for file changes...")
+            # RELIAB-01: no real-time watcher — periodic full scans are the sole sync
+            # mechanism (see main.py's FULL_RESCAN_INTERVAL_SECONDS docstring for why).
+            logger.info("AWS Copier is running. Rescanning every 6h...")
 
             while self.running and not self.shutdown_event.is_set():
                 try:
@@ -131,7 +127,11 @@ class AWSCopierGUIApp:
                     await asyncio.wait_for(self.shutdown_event.wait(), timeout=300)
                     break
                 except asyncio.TimeoutError:
-                    # Timeout is normal, continue monitoring
+                    if time.monotonic() - last_scan_monotonic >= 6 * 60 * 60:
+                        logger.info("Starting periodic full rescan")
+                        await self.file_listener.scan_all_folders()
+                        last_scan_monotonic = time.monotonic()
+                        logger.info("Periodic full rescan completed")
                     logger.debug("Heartbeat - AWS Copier still running")
                     continue
 
@@ -176,14 +176,6 @@ class AWSCopierGUIApp:
         """Clean up resources."""
         logger.info("Cleaning up resources...")
         self.running = False
-
-        try:
-            # Stop folder watcher
-            if hasattr(self, "folder_watcher"):
-                await self.folder_watcher.stop()
-                logger.info("Folder watcher stopped")
-        except Exception as e:
-            logger.error(f"Error stopping folder watcher: {e}")
 
         try:
             # Close S3 manager

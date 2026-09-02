@@ -110,49 +110,6 @@ class TestIgnoreRulesDirs:
         assert IGNORE_RULES.should_ignore_dir(link) is True
 
 
-class TestIgnoreRulesShouldIgnorePath:
-    """WATCH-01: should_ignore_path also catches files inside an ignored ancestor directory —
-    the gap should_ignore_file alone has, which real-time watchdog events hit (no batch-scan
-    should_ignore_dir recursion guard applies to a raw filesystem event)."""
-
-    def test_file_directly_in_ignored_dotdir_is_ignored(self, tmp_path):
-        """A file inside a dot-prefixed directory anywhere under root is ignored."""
-        path = tmp_path / ".sync" / "pictures_pictures" / "bisync.db"
-        assert IGNORE_RULES.should_ignore_path(path, tmp_path) is True
-
-    def test_file_in_named_ignored_ancestor_is_ignored(self):
-        """A file under a named ignore_dirs ancestor (e.g. node_modules) is ignored, at any depth."""
-        root = Path("/watch")
-        path = root / "project" / "node_modules" / "pkg" / "index.js"
-        assert IGNORE_RULES.should_ignore_path(path, root) is True
-
-    def test_normal_file_in_normal_dir_is_not_ignored(self):
-        """A plain file in a plain (non-ignored) directory tree is not ignored."""
-        root = Path("/watch")
-        path = root / "Pictures" / "2024" / "IMG_0001.JPG"
-        assert IGNORE_RULES.should_ignore_path(path, root) is False
-
-    def test_ignored_filename_itself_is_still_caught(self):
-        """A dotfile directly under root (no ignored ancestor dir involved) is still caught."""
-        root = Path("/watch")
-        path = root / ".env"
-        assert IGNORE_RULES.should_ignore_path(path, root) is True
-
-    def test_watch_root_itself_is_never_treated_as_ignored_ancestor(self):
-        """root is excluded from the ancestor check — a dot-prefixed watch root wouldn't self-ignore."""
-        root = Path("/watch/.hidden_root")
-        path = root / "photo.jpg"
-        assert IGNORE_RULES.should_ignore_path(path, root) is False
-
-    def test_path_outside_root_falls_back_to_filename_only_check(self):
-        """A path not under root (ValueError from relative_to) still checks the filename itself."""
-        root = Path("/watch")
-        outside = Path("/other/place/.env")
-        assert IGNORE_RULES.should_ignore_path(outside, root) is True  # filename itself ignored
-        outside_normal = Path("/other/place/photo.jpg")
-        assert IGNORE_RULES.should_ignore_path(outside_normal, root) is False
-
-
 class TestIgnoreRulesImmutability:
     """D-05: IgnoreRules must be frozen — prevents accidental mutation of the singleton."""
 
@@ -163,7 +120,7 @@ class TestIgnoreRulesImmutability:
 
 
 class TestIgnoreRulesSingleton:
-    """D-06: IGNORE_RULES is the canonical instance — FileListener & FileChangeHandler both import this."""
+    """D-06: IGNORE_RULES is the canonical instance imported by FileListener."""
 
     def test_singleton_importable(self):
         assert isinstance(IGNORE_RULES, IgnoreRules)

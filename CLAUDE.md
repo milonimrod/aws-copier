@@ -36,7 +36,6 @@ A personal Python daemon that watches local folders and incrementally backs them
 - `hatchling` - Build backend (`[build-system]` in `pyproject.toml`)
 ## Key Dependencies
 - `aiobotocore` >=2.24.1 - Truly async AWS SDK wrapper around botocore; used in `aws_copier/core/s3_manager.py` for all S3 operations
-- `watchdog` >=3.0.0 - Cross-platform file system event monitoring; used in `aws_copier/core/folder_watcher.py` via `Observer` and `FileSystemEventHandler`
 - `pyyaml` >=6.0.2 - YAML config parsing/writing in `aws_copier/models/simple_config.py`
 - `aiofiles` >=24.1.0 - Async file I/O for MD5 computation in `aws_copier/core/file_listener.py`
 - `python-dotenv` >=1.1.1 - `.env` loading in the `s3_manager.py` `main()` test harness
@@ -68,10 +67,10 @@ A personal Python daemon that watches local folders and incrementally backs them
 ## Conventions
 
 ## Naming Patterns
-- Module files use `snake_case`: `file_listener.py`, `s3_manager.py`, `folder_watcher.py`, `simple_config.py`
+- Module files use `snake_case`: `file_listener.py`, `s3_manager.py`, `simple_config.py`
 - Test files use `test_` prefix: `test_file_listener.py`, `test_s3_manager.py`
 - Entry point scripts use `snake_case`: `main.py`, `main_gui.py`
-- `PascalCase` for all classes: `FileListener`, `S3Manager`, `FolderWatcher`, `SimpleConfig`, `FileChangeHandler`
+- `PascalCase` for all classes: `FileListener`, `S3Manager`, `SimpleConfig`
 - `snake_case` for all methods and functions: `scan_all_folders`, `upload_file`, `check_exists`, `get_s3_name_for_folder`
 - Private methods prefixed with `_`: `_process_folder_recursively`, `_calculate_md5`, `_build_s3_key`, `_get_or_create_client`
 - Async methods are not specially named — async-ness is indicated only by `async def`
@@ -135,8 +134,13 @@ A personal Python daemon that watches local folders and incrementally backs them
 - Full asyncio-based processing for all I/O (file reads, S3 operations)
 - Two operating modes: headless CLI (`main.py`) and GUI with background thread (`main_gui.py`)
 - Incremental backup using per-directory `.milo_backup.info` JSON files to track MD5 hashes
-- Concurrency controlled via `asyncio.Semaphore` (upload: 50, MD5: 50 concurrent)
-- Watchdog library bridges synchronous OS file events into the asyncio event loop via `call_soon_threadsafe`
+- Concurrency controlled via `asyncio.Semaphore` (upload: config-driven, default 10; MD5: 10; folders: 20)
+- No real-time file watcher — periodic full rescans (`FULL_RESCAN_INTERVAL_SECONDS` in
+  `main.py`, default 6h) are the sole sync mechanism. A `watchdog`-based real-time watcher
+  existed previously; removed after two production bugs specific to that subsystem
+  (duplicate uploads from per-file debounce keying; files inside ignored directories
+  slipping through) plus a standing `inotify` event-queue-overflow risk under heavy
+  background filesystem churn.
 ## Layers
 - Purpose: Load, validate, and provide application settings
 - Location: `aws_copier/models/simple_config.py`
@@ -147,12 +151,7 @@ A personal Python daemon that watches local folders and incrementally backs them
 - Location: `aws_copier/core/file_listener.py`
 - Contains: `FileListener` class
 - Depends on: `S3Manager`, `SimpleConfig`, `aiofiles`
-- Used by: Application entry points, `FolderWatcher` (calls `_process_current_folder` directly)
-- Purpose: Real-time OS filesystem event monitoring; routes events to `FileListener`
-- Location: `aws_copier/core/folder_watcher.py`
-- Contains: `FolderWatcher`, `FileChangeHandler` (watchdog handler)
-- Depends on: `FileListener`, `SimpleConfig`, `watchdog`
-- Used by: Application entry points
+- Used by: Application entry points (`main.py`'s initial scan and periodic rescan)
 - Purpose: Async S3 client wrapper; handles upload, existence checks, multipart uploads
 - Location: `aws_copier/core/s3_manager.py`
 - Contains: `S3Manager` class
@@ -168,7 +167,6 @@ A personal Python daemon that watches local folders and incrementally backs them
 ## Data Flow
 - `FileListener._stats` dict tracks scanned/uploaded/skipped/error counts (in-memory, reset on restart)
 - `.milo_backup.info` files persist backup state to disk per directory
-- `FolderWatcher._stats` tracks watched folder count and event counts (in-memory)
 ## Key Abstractions
 - Purpose: Single source of truth for all settings; passed by reference to all components
 - Examples: `aws_copier/models/simple_config.py`
@@ -179,13 +177,10 @@ A personal Python daemon that watches local folders and incrementally backs them
 - Purpose: Encapsulates all AWS SDK calls; manages client lifecycle
 - Examples: `aws_copier/core/s3_manager.py`
 - Pattern: Single persistent client via `AsyncExitStack`; supports small files (`put_object`) and large files >100MB (`multipart_upload`); MD5 stored in S3 object metadata as `md5-checksum`
-- Purpose: Bridges synchronous watchdog events to the async event loop
-- Examples: `aws_copier/core/folder_watcher.py`
-- Pattern: Inherits from `watchdog.events.FileSystemEventHandler`; uses `call_soon_threadsafe` for thread safety
 ## Entry Points
 - Location: `/Users/nimrodmilo/dev/private/aws-copier/main.py`
 - Triggers: Direct `python main.py` or `aws-copier` script (via `pyproject.toml`)
-- Responsibilities: Config check, component initialization, initial scan, start watcher, 5-minute status loop
+- Responsibilities: Config check, component initialization, initial scan, 5-minute status loop (with periodic full rescan check + memory housekeeping each pass)
 - Location: `/Users/nimrodmilo/dev/private/aws-copier/main_gui.py`
 - Triggers: `python main_gui.py`
 - Responsibilities: Same as headless, plus tkinter GUI on main thread with background asyncio loop

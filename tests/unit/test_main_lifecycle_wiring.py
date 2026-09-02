@@ -45,7 +45,6 @@ def patched_app_explicit_creds():
         patch.object(main_module, "load_config", return_value=cfg),
         patch.object(main_module, "S3Manager") as mock_s3_cls,
         patch.object(main_module, "FileListener") as mock_fl_cls,
-        patch.object(main_module, "FolderWatcher") as mock_fw_cls,
     ):
         s3 = AsyncMock()
         s3.initialize = AsyncMock()
@@ -60,15 +59,10 @@ def patched_app_explicit_creds():
         fl._active_upload_tasks = set()
         mock_fl_cls.return_value = fl
 
-        fw = AsyncMock()
-        fw.start = AsyncMock()
-        fw.stop = AsyncMock()
-        mock_fw_cls.return_value = fw
-
         app = AWSCopierApp()
         # Short-circuit the status loop: set shutdown_event BEFORE awaiting start
         app.shutdown_event.set()
-        yield app, s3, fl, fw, cfg
+        yield app, s3, fl, cfg
 
 
 @pytest.fixture
@@ -79,7 +73,6 @@ def patched_app_chain_creds():
         patch.object(main_module, "load_config", return_value=cfg),
         patch.object(main_module, "S3Manager") as mock_s3_cls,
         patch.object(main_module, "FileListener") as mock_fl_cls,
-        patch.object(main_module, "FolderWatcher") as mock_fw_cls,
     ):
         s3 = AsyncMock()
         s3.initialize = AsyncMock()
@@ -94,14 +87,9 @@ def patched_app_chain_creds():
         fl._active_upload_tasks = set()
         mock_fl_cls.return_value = fl
 
-        fw = AsyncMock()
-        fw.start = AsyncMock()
-        fw.stop = AsyncMock()
-        mock_fw_cls.return_value = fw
-
         app = AWSCopierApp()
         app.shutdown_event.set()
-        yield app, s3, fl, fw, cfg
+        yield app, s3, fl, cfg
 
 
 class TestStartupWiring:
@@ -109,14 +97,14 @@ class TestStartupWiring:
 
     async def test_start_calls_ensure_lifecycle_rule(self, patched_app_explicit_creds):
         """ensure_lifecycle_rule is awaited during startup."""
-        app, s3, fl, fw, cfg = patched_app_explicit_creds
+        app, s3, fl, cfg = patched_app_explicit_creds
         await app.start()
         s3.initialize.assert_awaited_once()
         s3.ensure_lifecycle_rule.assert_awaited_once()
 
     async def test_initialize_called_before_ensure_lifecycle_rule(self, patched_app_explicit_creds):
         """initialize is called before ensure_lifecycle_rule (ordering guarantee)."""
-        app, s3, fl, fw, cfg = patched_app_explicit_creds
+        app, s3, fl, cfg = patched_app_explicit_creds
         call_order: list = []
 
         async def _init():
@@ -132,7 +120,7 @@ class TestStartupWiring:
 
     async def test_ensure_lifecycle_rule_called_before_scan_all_folders(self, patched_app_explicit_creds):
         """ensure_lifecycle_rule is called before the initial scan (CONFIG-07 ordering)."""
-        app, s3, fl, fw, cfg = patched_app_explicit_creds
+        app, s3, fl, cfg = patched_app_explicit_creds
         call_order: list = []
 
         async def _ensure():
@@ -148,7 +136,7 @@ class TestStartupWiring:
 
     async def test_logs_credential_source_config_yaml(self, patched_app_explicit_creds, caplog):
         """D-10: startup logs 'AWS credentials loaded from: config.yaml' when explicit creds are present."""
-        app, s3, fl, fw, cfg = patched_app_explicit_creds
+        app, s3, fl, cfg = patched_app_explicit_creds
         assert cfg.credential_source == "config.yaml"
         with caplog.at_level(logging.INFO):
             await app.start()
@@ -159,7 +147,7 @@ class TestStartupWiring:
 
     async def test_logs_credential_source_provider_chain(self, patched_app_chain_creds, caplog):
         """D-10: startup logs provider chain source when no explicit creds in config."""
-        app, s3, fl, fw, cfg = patched_app_chain_creds
+        app, s3, fl, cfg = patched_app_chain_creds
         assert cfg.use_credential_chain is True
         with caplog.at_level(logging.INFO):
             await app.start()
@@ -171,7 +159,7 @@ class TestStartupWiring:
 
     async def test_start_does_not_crash_when_ensure_lifecycle_rule_returns_none(self, patched_app_explicit_creds):
         """Startup completes without error when ensure_lifecycle_rule returns None (D-11 best-effort)."""
-        app, s3, fl, fw, cfg = patched_app_explicit_creds
+        app, s3, fl, cfg = patched_app_explicit_creds
         s3.ensure_lifecycle_rule.return_value = None
         # Must complete without raising
         await app.start()
@@ -182,13 +170,13 @@ class TestMemoryHousekeeping:
 
     async def test_status_loop_clears_file_listener_caches(self, patched_app_explicit_creds):
         """clear_caches() is called during the (short-circuited, single-pass) status loop."""
-        app, s3, fl, fw, cfg = patched_app_explicit_creds
+        app, s3, fl, cfg = patched_app_explicit_creds
         await app.start()
         fl.clear_caches.assert_called_once()
 
     async def test_status_loop_calls_trim_memory(self, patched_app_explicit_creds):
         """_trim_memory() is invoked each status loop pass."""
-        app, s3, fl, fw, cfg = patched_app_explicit_creds
+        app, s3, fl, cfg = patched_app_explicit_creds
         with patch.object(main_module, "_trim_memory") as mock_trim:
             await app.start()
         mock_trim.assert_called_once()
@@ -234,7 +222,7 @@ class TestPeriodicFullRescan:
 
     async def test_does_not_rescan_before_interval_elapsed(self, patched_app_explicit_creds):
         """With the interval not yet elapsed, scan_all_folders is not called again."""
-        app, s3, fl, fw, cfg = patched_app_explicit_creds
+        app, s3, fl, cfg = patched_app_explicit_creds
         app._last_full_scan_monotonic = 1000.0
         with patch.object(main_module.time, "monotonic", return_value=1000.0 + 60):
             await app._maybe_run_periodic_rescan()
@@ -242,7 +230,7 @@ class TestPeriodicFullRescan:
 
     async def test_rescans_after_interval_elapsed(self, patched_app_explicit_creds):
         """Once FULL_RESCAN_INTERVAL_SECONDS has elapsed, a full rescan is triggered."""
-        app, s3, fl, fw, cfg = patched_app_explicit_creds
+        app, s3, fl, cfg = patched_app_explicit_creds
         base = 1000.0
         later = base + main_module.FULL_RESCAN_INTERVAL_SECONDS + 1
         app._last_full_scan_monotonic = base
@@ -252,7 +240,7 @@ class TestPeriodicFullRescan:
 
     async def test_last_full_scan_monotonic_updates_after_periodic_rescan(self, patched_app_explicit_creds):
         """_last_full_scan_monotonic is refreshed to the new timestamp after the periodic rescan."""
-        app, s3, fl, fw, cfg = patched_app_explicit_creds
+        app, s3, fl, cfg = patched_app_explicit_creds
         base = 1000.0
         later = base + main_module.FULL_RESCAN_INTERVAL_SECONDS + 1
         app._last_full_scan_monotonic = base
@@ -262,7 +250,7 @@ class TestPeriodicFullRescan:
 
     async def test_start_sets_last_full_scan_monotonic_after_initial_scan(self, patched_app_explicit_creds):
         """AWSCopierApp.start() records _last_full_scan_monotonic right after the initial scan."""
-        app, s3, fl, fw, cfg = patched_app_explicit_creds
+        app, s3, fl, cfg = patched_app_explicit_creds
         assert app._last_full_scan_monotonic == 0.0
         await app.start()
         assert app._last_full_scan_monotonic > 0.0
@@ -284,7 +272,6 @@ class TestConfigPathWiring:
             patch.object(main_module, "load_config", return_value=cfg) as mock_load_config,
             patch.object(main_module, "S3Manager"),
             patch.object(main_module, "FileListener"),
-            patch.object(main_module, "FolderWatcher"),
         ):
             AWSCopierApp()
             mock_load_config.assert_called_once_with(Path("config.yaml"))
@@ -297,7 +284,6 @@ class TestConfigPathWiring:
             patch.object(main_module, "load_config", return_value=cfg) as mock_load_config,
             patch.object(main_module, "S3Manager"),
             patch.object(main_module, "FileListener"),
-            patch.object(main_module, "FolderWatcher"),
         ):
             AWSCopierApp(config_path=custom_path)
             mock_load_config.assert_called_once_with(custom_path)

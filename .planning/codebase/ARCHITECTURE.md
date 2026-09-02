@@ -10,8 +10,14 @@
 - Full asyncio-based processing for all I/O (file reads, S3 operations)
 - Two operating modes: headless CLI (`main.py`) and GUI with background thread (`main_gui.py`)
 - Incremental backup using per-directory `.milo_backup.info` JSON files to track MD5 hashes
-- Concurrency controlled via `asyncio.Semaphore` (upload: 50, MD5: 50 concurrent)
-- Watchdog library bridges synchronous OS file events into the asyncio event loop via `call_soon_threadsafe`
+- Concurrency controlled via `asyncio.Semaphore` (upload: config-driven, default 10; MD5: 10; folders: 20)
+- No real-time file watcher — periodic full rescans (`FULL_RESCAN_INTERVAL_SECONDS` in
+  `main.py`, default 6h) are the sole sync mechanism. A `watchdog`-based real-time watcher
+  (`FolderWatcher`/`FileChangeHandler`) existed previously; removed after two production bugs
+  specific to that subsystem (duplicate uploads from per-file debounce keying; files inside
+  ignored directories slipping through undetected) plus a standing `inotify` event-queue-
+  overflow risk under heavy background filesystem churn (e.g. a NAS-bundled cloud-sync tool
+  continuously walking the same watched tree).
 
 ## Layers
 
@@ -27,14 +33,7 @@
 - Location: `aws_copier/core/file_listener.py`
 - Contains: `FileListener` class
 - Depends on: `S3Manager`, `SimpleConfig`, `aiofiles`
-- Used by: Application entry points, `FolderWatcher` (calls `_process_current_folder` directly)
-
-**Core Layer — Folder Watcher:**
-- Purpose: Real-time OS filesystem event monitoring; routes events to `FileListener`
-- Location: `aws_copier/core/folder_watcher.py`
-- Contains: `FolderWatcher`, `FileChangeHandler` (watchdog handler)
-- Depends on: `FileListener`, `SimpleConfig`, `watchdog`
-- Used by: Application entry points
+- Used by: Application entry points (`main.py`'s initial scan and periodic rescan)
 
 **Core Layer — S3 Manager:**
 - Purpose: Async S3 client wrapper; handles upload, existence checks, multipart uploads
@@ -69,12 +68,14 @@
    e. Before upload, check S3 existence via `S3Manager.check_exists(key, md5)` to skip already-synced files
    f. After successful uploads, write updated `.milo_backup.info`
 
-**Real-Time Monitoring:**
+**Periodic Rescan (replaces the former real-time watcher — see Pattern Overview):**
 
-1. `FolderWatcher.start()` registers `FileChangeHandler` with watchdog `Observer` for each watch folder
-2. Watchdog emits `on_any_event()` on the OS monitor thread for `created` / `modified` events
-3. `FileChangeHandler.on_any_event()` calls `event_loop.call_soon_threadsafe(asyncio.create_task, ...)` to bridge into the async loop
-4. `_process_changed_file()` calls `FileListener._process_current_folder(file.parent)` — reuses the same incremental logic
+1. `AWSCopierApp.start()` runs `FileListener.scan_all_folders()` once at startup
+2. The 5-minute status loop calls `_maybe_run_periodic_rescan()` each pass, which re-runs
+   `scan_all_folders()` once `FULL_RESCAN_INTERVAL_SECONDS` (default 6h) has elapsed since
+   the last full scan
+3. Already-synced folders skip fast via the `.milo_backup.info` mtime cache — a rescan costs
+   a tree walk, not re-uploading, for anything unchanged
 
 **GUI Mode — Threading:**
 
@@ -86,7 +87,7 @@
 **State Management:**
 - `FileListener._stats` dict tracks scanned/uploaded/skipped/error counts (in-memory, reset on restart)
 - `.milo_backup.info` files persist backup state to disk per directory
-- `FolderWatcher._stats` tracks watched folder count and event counts (in-memory)
+- `AWSCopierApp._last_full_scan_monotonic` tracks when the last full scan (initial or periodic) completed (in-memory)
 
 ## Key Abstractions
 
@@ -105,17 +106,12 @@
 - Examples: `aws_copier/core/s3_manager.py`
 - Pattern: Single persistent client via `AsyncExitStack`; supports small files (`put_object`) and large files >100MB (`multipart_upload`); MD5 stored in S3 object metadata as `md5-checksum`
 
-**FileChangeHandler:**
-- Purpose: Bridges synchronous watchdog events to the async event loop
-- Examples: `aws_copier/core/folder_watcher.py`
-- Pattern: Inherits from `watchdog.events.FileSystemEventHandler`; uses `call_soon_threadsafe` for thread safety
-
 ## Entry Points
 
 **Headless CLI (`main.py`):**
 - Location: `/Users/nimrodmilo/dev/private/aws-copier/main.py`
 - Triggers: Direct `python main.py` or `aws-copier` script (via `pyproject.toml`)
-- Responsibilities: Config check, component initialization, initial scan, start watcher, 5-minute status loop
+- Responsibilities: Config check, component initialization, initial scan, 5-minute status loop (periodic full rescan check + memory housekeeping each pass)
 
 **GUI Entry (`main_gui.py`):**
 - Location: `/Users/nimrodmilo/dev/private/aws-copier/main_gui.py`
@@ -145,7 +141,7 @@
 
 **Authentication:** AWS credentials stored in `config.yaml` (plaintext); passed directly to `aiobotocore` `create_client` calls; no IAM role / environment variable fallback in the current implementation
 
-**Ignore Lists:** Both `FileListener` and `FileChangeHandler` maintain their own hardcoded ignore pattern sets (duplicated); covers `.DS_Store`, temp files, `.git`, `node_modules`, `__pycache__`, etc.
+**Ignore Lists:** Centralized in `aws_copier/core/ignore_rules.py`'s `IGNORE_RULES` singleton, used by `FileListener`; covers `.DS_Store`, temp files, `.git`, `node_modules`, `__pycache__`, etc.
 
 ---
 

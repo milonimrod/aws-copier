@@ -10,7 +10,6 @@ import time
 from pathlib import Path
 
 from aws_copier.core.file_listener import FileListener
-from aws_copier.core.folder_watcher import FolderWatcher
 from aws_copier.core.s3_manager import S3Manager
 from aws_copier.models.simple_config import SimpleConfig, load_config
 from aws_copier.web.dashboard import WebDashboard
@@ -19,15 +18,16 @@ from aws_copier.web.dashboard import WebDashboard
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# RELIAB-01: periodic full-rescan safety net. The real-time watcher is usually sufficient,
-# but it depends on inotify events actually being delivered — a busy watched filesystem
-# (e.g. a NAS-bundled cloud-sync tool continuously walking the same tree, generating heavy
-# event traffic) can in principle overflow the kernel's inotify event queue and silently
-# drop events for unrelated files. Since scan_all_folders() otherwise only ever runs once,
-# at startup, a single missed real-time event would go undetected indefinitely. Re-running
-# the full scan periodically catches anything the real-time path ever missed, regardless of
-# cause, without needing a restart.
-FULL_RESCAN_INTERVAL_SECONDS = 12 * 60 * 60
+# RELIAB-01: this app has no real-time file watcher — periodic full scans are the only sync
+# mechanism, by design. An earlier version paired a real-time watchdog-based watcher with a
+# 12h periodic scan as a safety net; the watcher was removed entirely (both real bugs found
+# in production were in that subsystem specifically — debounce keyed per-file instead of
+# per-folder causing duplicate uploads, and ignored-ancestor-directory files slipping through
+# — and a NAS-bundled cloud-sync tool's continuous filesystem churn made inotify queue
+# overflow, and therefore silently missed events, a real risk on top of that). For a personal
+# backup tool, bounded periodic-scan latency is an acceptable tradeoff for removing an entire
+# class of bugs and the watchdog dependency outright, rather than patching around them.
+FULL_RESCAN_INTERVAL_SECONDS = 6 * 60 * 60
 
 
 def _trim_memory() -> None:
@@ -84,7 +84,6 @@ class AWSCopierApp:
         self.s3_manager = S3Manager(self.config)
         # Incremental backup components
         self.file_listener = FileListener(self.config, self.s3_manager)
-        self.folder_watcher = FolderWatcher(self.config, self.file_listener)  # Real-time monitoring
         self.web_dashboard = (
             WebDashboard(self.file_listener, port=self.config.web_port) if self.config.web_enabled else None
         )
@@ -124,10 +123,6 @@ class AWSCopierApp:
 
             stats = self.file_listener.get_statistics()
             logger.info(f"✅ Incremental backup completed: {stats}")
-
-            # Start folder watcher for real-time monitoring
-            await self.folder_watcher.start()
-            logger.info("✅ Folder Watcher started")
 
             self.running = True
             logger.info("🚀 AWS Copier started successfully")
@@ -175,13 +170,13 @@ class AWSCopierApp:
         making call counts unpredictable.
         """
         if time.monotonic() - self._last_full_scan_monotonic >= FULL_RESCAN_INTERVAL_SECONDS:
-            logger.info("🔄 Starting periodic full rescan (12h safety net)")
+            logger.info("🔄 Starting periodic full rescan (sole sync mechanism — no real-time watcher)")
             await self.file_listener.scan_all_folders()
             self._last_full_scan_monotonic = time.monotonic()
             logger.info(f"🔄 Periodic full rescan completed: {self.file_listener.get_statistics()}")
 
     async def shutdown(self) -> None:
-        """Shutdown the application (ASYNC-06): stop the watcher, drain in-flight uploads, close S3."""
+        """Shutdown the application (ASYNC-06): drain in-flight uploads, close S3."""
         if self._shutdown_called:
             # shutdown may be triggered by the signal handler AND by the main-loop finally clause;
             # the dedicated flag (not self.running) prevents double-cleanup even during init.
@@ -192,11 +187,7 @@ class AWSCopierApp:
         self.running = False
 
         try:
-            # Step 1: stop the folder watcher so no NEW events create new upload tasks.
-            await self.folder_watcher.stop()
-            logger.info("✅ Folder Watcher stopped")
-
-            # Step 2 (ASYNC-06): drain in-flight uploads for up to 60s (D-03).
+            # Step 1 (ASYNC-06): drain in-flight uploads for up to 60s (D-03).
             # Pitfall 3 guard: asyncio.wait raises ValueError on an empty set, so check first.
             upload_tasks = set(self.file_listener._active_upload_tasks)
             if upload_tasks:
@@ -211,11 +202,11 @@ class AWSCopierApp:
             else:
                 logger.info("No in-flight uploads to drain")
 
-            # Step 3: close S3 client.
+            # Step 2: close S3 client.
             await self.s3_manager.close()
             logger.info("✅ S3 Manager closed")
 
-            # Step 4: shut down the web dashboard last so final log lines are visible.
+            # Step 3: shut down the web dashboard last so final log lines are visible.
             if self.web_dashboard is not None:
                 await self.web_dashboard.stop()
                 logger.info("✅ Web dashboard stopped")

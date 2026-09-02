@@ -13,7 +13,7 @@ from main import AWSCopierApp
 
 @pytest.fixture
 def app(tmp_path, monkeypatch):
-    """Create an AWSCopierApp with mocked S3Manager, FileListener, FolderWatcher.
+    """Create an AWSCopierApp with mocked S3Manager, FileListener.
 
     The real FileListener is replaced by a MagicMock whose `_active_upload_tasks`
     attribute is a real `set[asyncio.Task]` (the code under test reads this set directly).
@@ -34,15 +34,12 @@ def app(tmp_path, monkeypatch):
     with (
         patch("main.S3Manager") as mock_s3_cls,
         patch("main.FileListener") as mock_fl_cls,
-        patch("main.FolderWatcher") as mock_fw_cls,
     ):
         mock_s3 = AsyncMock()
         mock_fl = MagicMock()
         mock_fl._active_upload_tasks = set()
-        mock_fw = AsyncMock()
         mock_s3_cls.return_value = mock_s3
         mock_fl_cls.return_value = mock_fl
-        mock_fw_cls.return_value = mock_fw
 
         instance = AWSCopierApp()
         instance.running = True  # simulate post-start state
@@ -154,11 +151,10 @@ class TestShutdownDrain:
         assert mock_wait.call_count == 0
         assert any("No in-flight uploads to drain" in rec.message for rec in caplog.records)
 
-    async def test_shutdown_calls_folder_watcher_stop_and_s3_close(self, app):
-        """Regression: the existing shutdown sequence (stop watcher, close S3) is preserved."""
+    async def test_shutdown_calls_s3_close(self, app):
+        """Regression: the existing shutdown sequence (close S3) is preserved."""
         app.file_listener._active_upload_tasks = set()
         await app.shutdown()
-        app.folder_watcher.stop.assert_awaited_once()
         app.s3_manager.close.assert_awaited_once()
 
     async def test_shutdown_is_idempotent(self, app):
@@ -168,4 +164,4 @@ class TestShutdownDrain:
         # running was flipped to False; second call should return early.
         assert app.running is False
         await app.shutdown()
-        app.folder_watcher.stop.assert_awaited_once()  # still only called once total
+        app.s3_manager.close.assert_awaited_once()  # still only called once total

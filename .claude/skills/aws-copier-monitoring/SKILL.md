@@ -1,13 +1,19 @@
 ---
 name: aws-copier-monitoring
-description: This skill should be used when checking whether the deployed aws-copier daemon is healthy — is it running, has the initial scan finished, is the real-time watcher active, are uploads succeeding, is memory/CPU normal. Use it for "is it working", "check on the deploy", "is the scan done yet", "check the NAS", or when asked to watch/monitor an in-progress scan after a deploy.
-version: 1.0.0
+description: This skill should be used when checking whether the deployed aws-copier daemon is healthy — is it running, has the initial/periodic scan finished, are uploads succeeding, is memory/CPU normal. Use it for "is it working", "check on the deploy", "is the scan done yet", "check the NAS", or when asked to watch/monitor an in-progress scan after a deploy.
+version: 2.0.0
 ---
 
 # AWS Copier Monitoring
 
 How to check the health of the running aws-copier container on the NAS, and how to tell
 normal/expected log noise apart from a real problem.
+
+**No real-time file watcher.** aws-copier syncs only during a scan: once at startup, then
+periodically every `FULL_RESCAN_INTERVAL_SECONDS` (default 6h, in `main.py`) as the sole
+sync mechanism — see the `aws-copier-architecture` skill for why the real-time watcher was
+removed. A file dropped into a watched folder is not picked up until the next scan runs;
+that's expected, not a bug.
 
 ## Quick health check
 
@@ -18,33 +24,29 @@ ssh -l "Nimrod Milo" 192.168.8.201 "docker ps --filter name=aws-copier --format 
 `Up <duration>` with no restart loop is healthy. If it's repeatedly restarting, `docker logs
 aws-copier --tail 50` to see the crash.
 
-## Is the initial scan still running, or has it finished?
+## Is a scan (initial or periodic) still running, or has it finished?
 
-`main.py`'s startup sequence is: connect to S3 → run the full `scan_all_folders()` once →
-**only then** start the real-time folder watcher. For a large library this scan can take a
-long time (confirmed: tens of thousands of files, multiple hours on first run) — and until
-it finishes, **new files dropped into watched folders are not picked up at all**, since the
-watcher isn't running yet. This is expected behavior, not a bug, but it's the single most
-common "why isn't it picking up my new photos" question.
-
-Check whether it's finished:
+For a large library the initial scan can take a long time (confirmed: tens of thousands of
+files, multiple hours on first run over a slow link). Check whether the most recent scan has
+finished:
 
 ```bash
-ssh -l "Nimrod Milo" 192.168.8.201 "docker logs aws-copier 2>&1 | grep -E 'Folder Watcher started|Incremental backup completed'"
+ssh -l "Nimrod Milo" 192.168.8.201 "docker logs aws-copier 2>&1 | grep -E 'Incremental backup completed|Starting periodic full rescan|Periodic full rescan completed' | tail -5"
 ```
 
-Empty output = still scanning. Once you see `Folder Watcher started`, real-time tracking is
-live.
+`Incremental backup completed: {...}` marks the initial scan finishing. `Starting periodic
+full rescan` / `Periodic full rescan completed: {...}` mark each subsequent one — these
+recur roughly every `FULL_RESCAN_INTERVAL_SECONDS`, checked once per 5-minute status-loop
+pass, so the actual trigger can lag the exact interval by up to ~5 minutes.
 
-## Scan progress while it's still running
+## Scan progress while one is running
 
 ```bash
 ssh -l "Nimrod Milo" 192.168.8.201 "docker logs aws-copier 2>&1 | grep -c 'Uploaded:'"
 ```
 
-Gives a running total of files uploaded so far this scan. Compare two readings a few minutes
-apart to gauge throughput. Tail the log directly for a live view of which folder it's
-currently on:
+Gives a running total of files uploaded so far. Compare two readings a few minutes apart to
+gauge throughput. Tail the log directly for a live view of which folder it's currently on:
 
 ```bash
 ssh -l "Nimrod Milo" 192.168.8.201 "docker logs aws-copier --tail 10"
@@ -53,12 +55,12 @@ ssh -l "Nimrod Milo" 192.168.8.201 "docker logs aws-copier --tail 10"
 For a long wait, use a polling loop rather than repeated manual checks:
 
 ```bash
-ssh -l "Nimrod Milo" 192.168.8.201 "until docker logs aws-copier 2>&1 | grep -q 'Folder Watcher started'; do sleep 10; done; echo DONE"
+ssh -l "Nimrod Milo" 192.168.8.201 "until docker logs aws-copier 2>&1 | grep -q 'Incremental backup completed'; do sleep 10; done; echo DONE"
 ```
 
 Run this via a background shell task with a generous timeout (large libraries can take a
-long time even after the CONC-02 concurrent-folder-traversal optimization) — don't block
-on it synchronously.
+long time even with the CONC-02 concurrent-folder-traversal optimization) — don't block on
+it synchronously.
 
 ## The live dashboard
 
@@ -66,23 +68,6 @@ on it synchronously.
 browser-based live log/stat view via SSE, started *before* the scan begins so it's available
 even mid-scan. Good for a human glancing at progress; the SSH/log-grep approach above is
 better for scripted checks.
-
-## Testing that real-time watching actually works
-
-Docker bind mounts on native Linux (the NAS's own Docker, not Docker Desktop) propagate
-`inotify` events correctly — this has been verified empirically, not just assumed. To
-re-confirm after any relevant change:
-
-1. Start tailing logs in the background: `ssh -l "Nimrod Milo" 192.168.8.201 "docker logs -f aws-copier"`.
-2. Create a **clearly-named test file** in a test subfolder under the watched path (e.g.
-   `/volume1/pictures/ClaudeWatchTest/test.txt` over SSH) — never touch real files for this.
-3. Within ~2-5 seconds (the debounce window plus processing time) you should see `📁 File
-   created:` then an upload log line for it.
-4. **Clean up the test file/folder afterward** — `rm -rf` it from the NAS and, if it made it
-   to S3, delete the corresponding test object too.
-
-This only works once the watcher has actually started (see above) — testing during the
-initial scan will show nothing happening, which is expected, not a failure.
 
 ## Known-benign log lines (do not treat as errors)
 
@@ -106,6 +91,11 @@ initial scan will show nothing happening, which is expected, not a failure.
   need, check that loop is actually executing (look for repeated `📊 Backup Status:` lines
   in the logs at ~5-minute intervals — their presence confirms the housekeeping call
   alongside them is running too).
+- Multiple `Updated backup info for <same folder>: N uploaded` lines for what should have
+  been a single batch of new files landing in one folder — this was a real bug (debounce
+  keyed per-file, not per-folder) that's since been fixed by removing the real-time watcher
+  entirely; shouldn't be possible anymore since only scheduled scans (never overlapping)
+  trigger uploads now.
 - Any `ERROR` line with a Python traceback that isn't one of the two benign cases above.
 
 ## Spot-checking S3 state directly
