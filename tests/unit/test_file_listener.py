@@ -172,6 +172,34 @@ class TestFileListenerCore:
         assert "new_file.txt" in uploaded_files
 
 
+class TestScanStatistics:
+    """STATS-01: scan_all_folders resets stats each call; skipped_files counts once per file."""
+
+    async def test_scan_all_folders_resets_stats_at_start(self, file_listener, temp_watch_folder):
+        """A second scan's stats reflect only that scan, not an accumulating total."""
+        await file_listener.scan_all_folders()
+        first_scan_uploaded = file_listener.get_statistics()["uploaded_files"]
+        assert first_scan_uploaded > 0  # sanity: fixture files did get uploaded
+
+        # Second scan: nothing changed, so uploaded_files must reset to 0, not stay >0.
+        await file_listener.scan_all_folders()
+        second_scan_stats = file_listener.get_statistics()
+        assert second_scan_stats["uploaded_files"] == 0
+        assert second_scan_stats["scanned_folders"] > 0  # this scan did run, just uploaded nothing
+
+    async def test_skipped_files_counted_once_per_unchanged_file(self, file_listener, temp_watch_folder):
+        """An unchanged file (mtime-cache hit on the second scan) increments skipped_files by
+        exactly 1, not 2 — regression for double-counting between the mtime-skip fast path in
+        _scan_current_files and the definitive skip decision in _determine_files_to_upload."""
+        await file_listener.scan_all_folders()  # first scan: everything is new, nothing skipped yet
+
+        await file_listener.scan_all_folders()  # second scan: all fixture files unchanged
+        stats = file_listener.get_statistics()
+        # temp_watch_folder fixture has 5 files total (2 root + 2 subdir + 1 nested), all
+        # hitting the mtime-cache fast path on this second scan.
+        assert stats["skipped_files"] == 5
+
+
 class TestFileListenerOperations:
     """Test specific FileListener operations."""
 

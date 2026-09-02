@@ -179,7 +179,14 @@ class FileListener:
         return PathSpec.from_lines("gitignore", all_patterns)
 
     async def scan_all_folders(self) -> None:
-        """Scan all configured watch folders using incremental backup approach."""
+        """Scan all configured watch folders using incremental backup approach.
+
+        STATS-01: resets statistics first, so the dashboard/status log reflects only the
+        scan currently in progress rather than an ever-growing cumulative total across the
+        process's lifetime (this is the sole sync mechanism, called both for the initial
+        scan and every periodic rescan — see main.py's FULL_RESCAN_INTERVAL_SECONDS).
+        """
+        self.reset_statistics()
         logger.info("Starting incremental backup scan of all watch folders")
 
         with logging_redirect_tqdm():
@@ -437,8 +444,11 @@ class FileListener:
 
                 entry = existing_backup_info.get(file_path.name)
                 if entry and entry.get("mtime") == stat.st_mtime:
-                    # mtime unchanged → skip MD5, carry forward existing entry
-                    self._stats["skipped_files"] += 1
+                    # mtime unchanged → skip MD5, carry forward existing entry. STATS-01: not
+                    # counted here — _determine_files_to_upload's "unchanged" branch is the
+                    # single definitive skip-count point for every file, regardless of which
+                    # path (mtime-cache hit here, or a fresh MD5 that turned out unchanged)
+                    # led there. Double-counting here inflated skipped_files ~2x.
                     current_files[file_path.name] = entry
                     continue
 
