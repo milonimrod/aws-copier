@@ -6,6 +6,7 @@ import gc
 import logging
 import signal
 import sys
+import time
 from pathlib import Path
 
 from aws_copier.core.file_listener import FileListener
@@ -17,6 +18,16 @@ from aws_copier.web.dashboard import WebDashboard
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+# RELIAB-01: periodic full-rescan safety net. The real-time watcher is usually sufficient,
+# but it depends on inotify events actually being delivered — a busy watched filesystem
+# (e.g. a NAS-bundled cloud-sync tool continuously walking the same tree, generating heavy
+# event traffic) can in principle overflow the kernel's inotify event queue and silently
+# drop events for unrelated files. Since scan_all_folders() otherwise only ever runs once,
+# at startup, a single missed real-time event would go undetected indefinitely. Re-running
+# the full scan periodically catches anything the real-time path ever missed, regardless of
+# cause, without needing a restart.
+FULL_RESCAN_INTERVAL_SECONDS = 12 * 60 * 60
 
 
 def _trim_memory() -> None:
@@ -80,6 +91,9 @@ class AWSCopierApp:
         self.running = False
         self._shutdown_called = False  # re-entrancy guard, separate from self.running
         self.shutdown_event = asyncio.Event()
+        # RELIAB-01: set to time.monotonic() right after each full scan completes (initial
+        # or periodic); compared against in the status loop to trigger the next one.
+        self._last_full_scan_monotonic: float = 0.0
 
     async def start(self):
         """Start the application."""
@@ -106,6 +120,7 @@ class AWSCopierApp:
 
             # Run incremental backup scan of all folders
             await self.file_listener.scan_all_folders()
+            self._last_full_scan_monotonic = time.monotonic()
 
             stats = self.file_listener.get_statistics()
             logger.info(f"✅ Incremental backup completed: {stats}")
@@ -131,6 +146,11 @@ class AWSCopierApp:
                 gc.collect()
                 _trim_memory()
 
+                # RELIAB-01: periodic full rescan safety net — see module docstring above.
+                # Checked once per status-loop iteration (~every 5 min), so the actual
+                # trigger can lag the exact 12h mark by up to that long; negligible.
+                await self._maybe_run_periodic_rescan()
+
                 # Wait for shutdown event or timeout (5 minutes)
                 try:
                     await asyncio.wait_for(self.shutdown_event.wait(), timeout=300)
@@ -145,6 +165,20 @@ class AWSCopierApp:
             logger.error(f"Unexpected error: {e}", exc_info=True)
         finally:
             await self.shutdown()
+
+    async def _maybe_run_periodic_rescan(self) -> None:
+        """RELIAB-01: run a full rescan if FULL_RESCAN_INTERVAL_SECONDS have elapsed.
+
+        Extracted as its own method (rather than inlined in the status loop) specifically so
+        it's independently testable — patching time.monotonic() through the whole start()
+        flow also intercepts asyncio's own internal use of time.monotonic() for scheduling,
+        making call counts unpredictable.
+        """
+        if time.monotonic() - self._last_full_scan_monotonic >= FULL_RESCAN_INTERVAL_SECONDS:
+            logger.info("🔄 Starting periodic full rescan (12h safety net)")
+            await self.file_listener.scan_all_folders()
+            self._last_full_scan_monotonic = time.monotonic()
+            logger.info(f"🔄 Periodic full rescan completed: {self.file_listener.get_statistics()}")
 
     async def shutdown(self) -> None:
         """Shutdown the application (ASYNC-06): stop the watcher, drain in-flight uploads, close S3."""

@@ -222,6 +222,52 @@ class TestMemoryHousekeeping:
             main_module._trim_memory()  # must not raise
 
 
+class TestPeriodicFullRescan:
+    """RELIAB-01: a full rescan runs every FULL_RESCAN_INTERVAL_SECONDS as a safety net,
+    independent of the real-time watcher — catches anything it might have silently missed
+    (e.g. inotify event queue overflow from heavy background filesystem churn).
+
+    _maybe_run_periodic_rescan() is tested directly (not via the full start() flow):
+    patching time.monotonic() through start() also intercepts asyncio's own internal use of
+    time.monotonic() for scheduling, making call counts unpredictable.
+    """
+
+    async def test_does_not_rescan_before_interval_elapsed(self, patched_app_explicit_creds):
+        """With the interval not yet elapsed, scan_all_folders is not called again."""
+        app, s3, fl, fw, cfg = patched_app_explicit_creds
+        app._last_full_scan_monotonic = 1000.0
+        with patch.object(main_module.time, "monotonic", return_value=1000.0 + 60):
+            await app._maybe_run_periodic_rescan()
+        fl.scan_all_folders.assert_not_awaited()
+
+    async def test_rescans_after_interval_elapsed(self, patched_app_explicit_creds):
+        """Once FULL_RESCAN_INTERVAL_SECONDS has elapsed, a full rescan is triggered."""
+        app, s3, fl, fw, cfg = patched_app_explicit_creds
+        base = 1000.0
+        later = base + main_module.FULL_RESCAN_INTERVAL_SECONDS + 1
+        app._last_full_scan_monotonic = base
+        with patch.object(main_module.time, "monotonic", return_value=later):
+            await app._maybe_run_periodic_rescan()
+        fl.scan_all_folders.assert_awaited_once()
+
+    async def test_last_full_scan_monotonic_updates_after_periodic_rescan(self, patched_app_explicit_creds):
+        """_last_full_scan_monotonic is refreshed to the new timestamp after the periodic rescan."""
+        app, s3, fl, fw, cfg = patched_app_explicit_creds
+        base = 1000.0
+        later = base + main_module.FULL_RESCAN_INTERVAL_SECONDS + 1
+        app._last_full_scan_monotonic = base
+        with patch.object(main_module.time, "monotonic", return_value=later):
+            await app._maybe_run_periodic_rescan()
+        assert app._last_full_scan_monotonic == later
+
+    async def test_start_sets_last_full_scan_monotonic_after_initial_scan(self, patched_app_explicit_creds):
+        """AWSCopierApp.start() records _last_full_scan_monotonic right after the initial scan."""
+        app, s3, fl, fw, cfg = patched_app_explicit_creds
+        assert app._last_full_scan_monotonic == 0.0
+        await app.start()
+        assert app._last_full_scan_monotonic > 0.0
+
+
 class TestConfigPathWiring:
     """Regression tests: AWSCopierApp must load the same config.yaml that main() gate-checks.
 
