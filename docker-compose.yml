@@ -8,6 +8,10 @@ services:
     build: .
     container_name: aws-copier
     restart: unless-stopped
+    # Matches the app's own graceful-shutdown drain window (main.py waits up to 60s for
+    # in-flight uploads to finish after SIGTERM) — Docker's default is only 10s, which
+    # would SIGKILL mid-upload on every stop/restart regardless of the app's own handling.
+    stop_grace_period: 65s
     environment:
       # UID/GID the daemon runs as inside the container — match the owner of your NAS
       # shares so uploaded-file bookkeeping (.milo_backup.info) isn't written as root.
@@ -23,6 +27,7 @@ services:
       # One line per folder you want backed up. The container path (right of the colon)
       # must match a key under `watch_folders` in config.yaml.
       - /volume1/pictures:/data/pictures
+      - /volume1/@home/tali/Photos/MobileBackup:/data/tali_mobile
 
     ports:
       # Live log/status dashboard (aws_copier/web/dashboard.py). Drop this mapping, or set
