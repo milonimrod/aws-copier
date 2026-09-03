@@ -591,6 +591,29 @@ class S3Manager:
             logger.error(f"Unexpected error getting object info: {e}")
             return None
 
+    async def delete_object(self, s3_key: str) -> bool:
+        """Delete a single object from the bucket.
+
+        Args:
+            s3_key: Prefix-less S3 key to delete.
+
+        Returns:
+            True if the delete request succeeded (including if the key was already
+            gone — S3 DeleteObject is idempotent), False on any other failure.
+        """
+        try:
+            full_s3_key = self._build_s3_key(s3_key)
+            client = await self._get_or_create_client()
+            await asyncio.wait_for(
+                client.delete_object(Bucket=self.config.s3_bucket, Key=full_s3_key),
+                timeout=30,
+            )
+            logger.debug(f"Deleted S3 object: {full_s3_key}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete S3 object {s3_key}: {e}")
+            return False
+
     async def move_object(self, source_key: str, dest_key: str) -> bool:
         """Move an object within the bucket via server-side CopyObject, then delete the source.
 

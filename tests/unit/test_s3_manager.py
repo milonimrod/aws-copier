@@ -254,3 +254,41 @@ async def test_check_exists_with_md5_mismatch(mock_get_session, s3_manager):
 
     result = await s3_manager.check_exists("test.txt", expected_md5)
     assert result is False
+
+
+@pytest.mark.asyncio
+@patch("aws_copier.core.s3_manager.get_session")
+async def test_delete_object_success(mock_get_session, s3_manager):
+    """delete_object() issues DeleteObject with the fully-prefixed key and reports success."""
+    mock_session = MagicMock()
+    mock_s3_client = AsyncMock()
+    mock_s3_client.__aenter__ = AsyncMock(return_value=mock_s3_client)
+    mock_s3_client.__aexit__ = AsyncMock(return_value=None)
+
+    mock_session.create_client.return_value = mock_s3_client
+    mock_get_session.return_value = mock_session
+    s3_manager._s3_client = mock_s3_client
+
+    result = await s3_manager.delete_object("old/file.txt")
+
+    assert result is True
+    mock_s3_client.delete_object.assert_awaited_once_with(Bucket="test-bucket", Key="test-prefix/old/file.txt")
+
+
+@pytest.mark.asyncio
+@patch("aws_copier.core.s3_manager.get_session")
+async def test_delete_object_failure_returns_false(mock_get_session, s3_manager):
+    """delete_object() returns False (never raises) when the S3 call fails."""
+    mock_session = MagicMock()
+    mock_s3_client = AsyncMock()
+    mock_s3_client.__aenter__ = AsyncMock(return_value=mock_s3_client)
+    mock_s3_client.__aexit__ = AsyncMock(return_value=None)
+    mock_s3_client.delete_object.side_effect = Exception("boom")
+
+    mock_session.create_client.return_value = mock_s3_client
+    mock_get_session.return_value = mock_session
+    s3_manager._s3_client = mock_s3_client
+
+    result = await s3_manager.delete_object("old/file.txt")
+
+    assert result is False
