@@ -28,6 +28,8 @@ services:
       # must match a key under `watch_folders` in config.yaml.
       - /volume1/pictures:/data/pictures
       - /volume1/@home/tali/Photos/MobileBackup:/data/tali_mobile
+      - /volume1/@home/Nimrod Milo/Photos/MobileBackup:/data/nimrod_mobile
+      - /volume1/@home/daphna/Photos/MobileBackup:/data/daphna_mobile
 
     ports:
       # Live log/status dashboard (aws_copier/web/dashboard.py). Drop this mapping, or set
