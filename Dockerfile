@@ -21,6 +21,7 @@ COPY aws_copier/ ./aws_copier/
 COPY main.py ./
 COPY find_duplicates.py ./
 COPY find_scattered_duplicates.py ./
+COPY delete_scattered_duplicates.py ./
 COPY reorganize_cellphone_backup.py ./
 COPY cleanup_migrated_s3.py ./
 
