@@ -35,6 +35,7 @@ upload-large = "upload_large:main"
 find-duplicates = "find_duplicates:main"
 find-scattered-duplicates = "find_scattered_duplicates:main"
 delete-scattered-duplicates = "delete_scattered_duplicates:main"
+dedup-scattered-folders = "dedup_scattered_folders:main"
 reorganize-cellphone-backup = "reorganize_cellphone_backup:main"
 cleanup-migrated-s3 = "cleanup_migrated_s3:main"
 
