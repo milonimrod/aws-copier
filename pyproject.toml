@@ -33,6 +33,7 @@ ui = [
 aws-copier = "main:sync_main"
 upload-large = "upload_large:main"
 find-duplicates = "find_duplicates:main"
+find-scattered-duplicates = "find_scattered_duplicates:main"
 reorganize-cellphone-backup = "reorganize_cellphone_backup:main"
 cleanup-migrated-s3 = "cleanup_migrated_s3:main"
 
