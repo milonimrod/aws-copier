@@ -80,7 +80,7 @@ class TestLoadBackupIndex:
     def test_indexes_md5_and_s3_key(self, tmp_path):
         _write_backup_info(tmp_path / "bkp_20240528", {"a.jpg": ("md5a", "Pictures/bkp_20240528/a.jpg")})
 
-        index = load_backup_index(tmp_path)
+        index = load_backup_index([tmp_path])
 
         entry = index[tmp_path / "bkp_20240528" / "a.jpg"]
         assert entry == {"md5": "md5a", "s3_key": "Pictures/bkp_20240528/a.jpg"}
@@ -96,7 +96,7 @@ class TestBuildPlan:
             {"IMG_20240101_000000.jpg": ("md5a", "k/a.jpg"), "IMG_20240202_000000.jpg": ("md5b", "k/b.jpg")},
         )
 
-        plan = build_plan(source, tmp_path / "dest")
+        plan = build_plan([source], tmp_path / "dest")
 
         assert len(plan.keeps) == 2
         assert len(plan.duplicates) == 0
@@ -106,7 +106,7 @@ class TestBuildPlan:
         _write_backup_info(source / "bkp_20240101", {"IMG_20240101_000000.jpg": ("same_md5", "k/1.jpg")})
         _write_backup_info(source / "bkp_20240601", {"IMG_20240101_000000.jpg": ("same_md5", "k/2.jpg")})
 
-        plan = build_plan(source, tmp_path / "dest")
+        plan = build_plan([source], tmp_path / "dest")
 
         assert len(plan.keeps) == 1
         assert len(plan.duplicates) == 1
@@ -117,7 +117,7 @@ class TestBuildPlan:
         source = tmp_path / "tali_cellphone"
         _write_backup_info(source / "bkp", {"IMG_20240528_101112.jpg": ("md5a", "k/a.jpg")})
 
-        plan = build_plan(source, tmp_path / "dest")
+        plan = build_plan([source], tmp_path / "dest")
 
         assert plan.keeps[0].dest == tmp_path / "dest" / "2024" / "05" / "IMG_20240528_101112.jpg"
 
@@ -126,7 +126,7 @@ class TestBuildPlan:
         _write_backup_info(source / "bkp_a", {"photo.jpg": ("same_md5", "k/1.jpg")})
         _write_backup_info(source / "bkp_b", {"photo.jpg": ("same_md5", "k/2.jpg")})
 
-        plan = build_plan(source, tmp_path / "dest")
+        plan = build_plan([source], tmp_path / "dest")
 
         assert str(plan.duplicates[0].dest).startswith(str(tmp_path / "dest" / "_duplicates"))
 
@@ -135,7 +135,7 @@ class TestBuildPlan:
         source.mkdir(parents=True)
         (source / "orphan.jpg").write_bytes(b"x")  # No .milo_backup.info entry for it
 
-        plan = build_plan(tmp_path / "tali_cellphone", tmp_path / "dest")
+        plan = build_plan([tmp_path / "tali_cellphone"], tmp_path / "dest")
 
         assert plan.keeps == []
         assert plan.duplicates == []
@@ -148,7 +148,7 @@ class TestBuildPlan:
         _write_backup_info(source / "bkp_new", {"IMG_20250601_000000.jpg": ("same_md5", "k/new.jpg")})
         _write_backup_info(source / "bkp_old", {"IMG_20240101_000000.jpg": ("same_md5", "k/old.jpg")})
 
-        plan = build_plan(source, tmp_path / "dest")
+        plan = build_plan([source], tmp_path / "dest")
 
         assert len(plan.keeps) == 1
         assert plan.keeps[0].source.name == "IMG_20240101_000000.jpg"
@@ -162,8 +162,8 @@ class TestExecutePlan:
         _write_backup_info(source / "bkp", {"IMG_20240528_101112.jpg": ("md5a", "k/a.jpg")})
         dest_root = tmp_path / "dest"
 
-        plan = build_plan(source, dest_root)
-        manifest_path = execute_plan(plan, source, dest_root)
+        plan = build_plan([source], dest_root)
+        manifest_path = execute_plan(plan, [source], dest_root)
 
         dest_file = dest_root / "2024" / "05" / "IMG_20240528_101112.jpg"
         assert dest_file.exists()
@@ -181,8 +181,8 @@ class TestExecutePlan:
         _write_backup_info(source / "bkp" / "sub", {"a.jpg": ("md5a", "k/a.jpg")})
         dest_root = tmp_path / "dest"
 
-        plan = build_plan(source, dest_root)
-        execute_plan(plan, source, dest_root)
+        plan = build_plan([source], dest_root)
+        execute_plan(plan, [source], dest_root)
 
         assert not source.exists()
 
@@ -192,9 +192,62 @@ class TestExecutePlan:
         _write_backup_info(source / "bkp_b", {"photo.jpg": ("same_md5", "k/2.jpg")})
         dest_root = tmp_path / "dest"
 
-        plan = build_plan(source, dest_root)
-        manifest_path = execute_plan(plan, source, dest_root)
+        plan = build_plan([source], dest_root)
+        manifest_path = execute_plan(plan, [source], dest_root)
 
         lines = [json.loads(line) for line in manifest_path.read_text().splitlines()]
         types = {line["type"] for line in lines}
         assert types == {"keep", "duplicate"}
+
+
+class TestMultipleSources:
+    """Multiple source folders are deduplicated together, not just independently."""
+
+    def test_duplicate_across_two_separate_source_folders_is_detected(self, tmp_path):
+        source_a = tmp_path / "Nimrod phone"
+        source_b = tmp_path / "Nimrod_cellphone"
+        _write_backup_info(source_a / "bkp", {"photo.jpg": ("same_md5", "k/1.jpg")})
+        _write_backup_info(source_b / "bkp", {"photo.jpg": ("same_md5", "k/2.jpg")})
+
+        plan = build_plan([source_a, source_b], tmp_path / "dest")
+
+        assert len(plan.keeps) == 1
+        assert len(plan.duplicates) == 1
+
+    def test_duplicate_quarantine_path_preserves_its_own_source_relative_structure(self, tmp_path):
+        source_a = tmp_path / "Nimrod phone"
+        source_b = tmp_path / "Nimrod_cellphone"
+        _write_backup_info(source_a / "DCIM", {"a.jpg": ("same_md5", "k/1.jpg")})
+        _write_backup_info(source_b / "Camera", {"b.jpg": ("same_md5", "k/2.jpg")})
+
+        plan = build_plan([source_a, source_b], tmp_path / "dest")
+
+        dup_dest = plan.duplicates[0].dest
+        # Whichever one is the duplicate, its quarantine path must be rooted at ITS OWN
+        # source folder's relative structure, not the other source's.
+        assert str(dup_dest).startswith(str(tmp_path / "dest" / "_duplicates"))
+        assert dup_dest.name in ("a.jpg", "b.jpg")
+
+    def test_unique_files_from_both_sources_are_all_kept(self, tmp_path):
+        source_a = tmp_path / "Nimrod phone"
+        source_b = tmp_path / "Nimrod_cellphone"
+        _write_backup_info(source_a / "bkp", {"a.jpg": ("md5a", "k/a.jpg")})
+        _write_backup_info(source_b / "bkp", {"b.jpg": ("md5b", "k/b.jpg")})
+
+        plan = build_plan([source_a, source_b], tmp_path / "dest")
+
+        assert len(plan.keeps) == 2
+        assert len(plan.duplicates) == 0
+
+    def test_execute_plan_cleans_up_empty_dirs_in_every_source(self, tmp_path):
+        source_a = tmp_path / "Nimrod phone"
+        source_b = tmp_path / "Nimrod_cellphone"
+        _write_backup_info(source_a / "bkp", {"a.jpg": ("md5a", "k/a.jpg")})
+        _write_backup_info(source_b / "bkp", {"b.jpg": ("md5b", "k/b.jpg")})
+        dest_root = tmp_path / "dest"
+
+        plan = build_plan([source_a, source_b], dest_root)
+        execute_plan(plan, [source_a, source_b], dest_root)
+
+        assert not source_a.exists()
+        assert not source_b.exists()

@@ -17,11 +17,16 @@ confirmed to have happened, run cleanup_migrated_s3.py against the manifest this
 writes to delete the now-redundant old S3 objects (duplicates immediately, each kept
 file's old key only after its new key is confirmed present).
 
+Accepts multiple source folders (deduplicated across all of them together, not just within
+each individually — --dest-root is then required explicitly, since there's no single
+obvious parent to default to).
+
 Dry-run by default — prints the full plan without touching any file. Pass --execute to
 actually move files and write the manifest.
 
     docker exec aws-copier python reorganize_cellphone_backup.py /data/pictures/cellphone_bkp/tali_cellphone
     docker exec aws-copier python reorganize_cellphone_backup.py /data/pictures/cellphone_bkp/tali_cellphone --execute
+    docker exec aws-copier python reorganize_cellphone_backup.py "/data/pictures/cellphone_bkp/Nimrod phone" /data/pictures/cellphone_bkp/Nimrod_cellphone --dest-root /data/pictures/cellphone_bkp
 """
 
 import argparse
@@ -134,32 +139,33 @@ def determine_date(path: Path) -> Tuple[Optional[datetime], str]:
     return None, "unknown"
 
 
-def load_backup_index(source: Path) -> Dict[Path, Dict[str, Optional[str]]]:
+def load_backup_index(sources: List[Path]) -> Dict[Path, Dict[str, Optional[str]]]:
     """Reuse each file's MD5 and recorded S3 key from .milo_backup.info — no re-hashing.
 
     Args:
-        source: Root folder to search for .milo_backup.info files under.
+        sources: Root folders to search for .milo_backup.info files under.
 
     Returns:
         Mapping of local file Path to {"md5": ..., "s3_key": ...} (s3_key may be None for
         legacy entries recorded before that field existed).
     """
     index: Dict[Path, Dict[str, Optional[str]]] = {}
-    for info_file in source.rglob(".milo_backup.info"):
-        try:
-            data = json.loads(info_file.read_text(encoding="utf-8"))
-        except Exception as e:
-            logger.warning(f"Could not read {info_file}: {e}")
-            continue
-        folder = info_file.parent
-        for filename, entry in data.get("files", {}).items():
-            if isinstance(entry, dict):
-                md5 = entry.get("md5")
-                s3_key = entry.get("s3_key")
-            else:
-                md5, s3_key = entry, None
-            if md5:
-                index[folder / filename] = {"md5": md5, "s3_key": s3_key}
+    for source in sources:
+        for info_file in source.rglob(".milo_backup.info"):
+            try:
+                data = json.loads(info_file.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.warning(f"Could not read {info_file}: {e}")
+                continue
+            folder = info_file.parent
+            for filename, entry in data.get("files", {}).items():
+                if isinstance(entry, dict):
+                    md5 = entry.get("md5")
+                    s3_key = entry.get("s3_key")
+                else:
+                    md5, s3_key = entry, None
+                if md5:
+                    index[folder / filename] = {"md5": md5, "s3_key": s3_key}
     return index
 
 
@@ -174,21 +180,37 @@ def _unique_destination(dest: Path, used: set) -> Path:
     return candidate
 
 
-def build_plan(source: Path, dest_root: Path) -> Plan:
-    """Build the full move plan: one kept file per MD5 group, duplicates quarantined.
+def _source_root_for(path: Path, sources: List[Path]) -> Path:
+    """Find which of the given source roots a path lives under (for computing quarantine
+    destinations that preserve each file's original relative structure)."""
+    for root in sources:
+        try:
+            path.relative_to(root)
+            return root
+        except ValueError:
+            continue
+    raise ValueError(f"{path} is not under any of {sources}")
+
+
+def build_plan(sources: List[Path], dest_root: Path) -> Plan:
+    """Build the full move plan: one kept file per MD5 group, duplicates quarantined —
+    deduplicating ACROSS all given source folders, not just within each individually.
 
     Args:
-        source: Folder to scan recursively for media files.
+        sources: Folder(s) to scan recursively for media files.
         dest_root: Root under which <year>/<month>/ (kept) and _duplicates/, _unsorted/
             (quarantined / date-unknown) are created.
 
     Returns:
         The Plan describing every file's destination.
     """
-    backup_index = load_backup_index(source)
+    backup_index = load_backup_index(sources)
 
     all_files = [
-        p for p in source.rglob("*") if p.is_file() and p.name != ".milo_backup.info" and p.suffix.lower() in MEDIA_EXTENSIONS
+        p
+        for source in sources
+        for p in source.rglob("*")
+        if p.is_file() and p.name != ".milo_backup.info" and p.suffix.lower() in MEDIA_EXTENSIONS
     ]
 
     by_md5: Dict[str, List[Path]] = defaultdict(list)
@@ -222,7 +244,9 @@ def build_plan(source: Path, dest_root: Path) -> Plan:
         for p, d, src in dated:
             if p == keeper_path:
                 continue
-            dup_dest = _unique_destination(dest_root / "_duplicates" / p.relative_to(source), used_dest_paths)
+            dup_dest = _unique_destination(
+                dest_root / "_duplicates" / p.relative_to(_source_root_for(p, sources)), used_dest_paths
+            )
             duplicates.append(
                 PlanEntry(source=p, dest=dup_dest, md5=md5, old_s3_key=backup_index[p]["s3_key"], date_source=src)
             )
@@ -258,12 +282,12 @@ def print_plan_summary(plan: Plan, dest_root: Path) -> None:
         print(f"    DUP   {entry.source} -> {entry.dest}")
 
 
-def execute_plan(plan: Plan, source: Path, dest_root: Path) -> Path:
+def execute_plan(plan: Plan, sources: List[Path], dest_root: Path) -> Path:
     """Physically move every planned file and append a manifest entry for each.
 
     Args:
         plan: The plan built by build_plan().
-        source: The folder being migrated (used to clean up now-empty subdirectories).
+        sources: The folders being migrated (used to clean up now-empty subdirectories).
         dest_root: Root the manifest file is written under.
 
     Returns:
@@ -290,8 +314,9 @@ def execute_plan(plan: Plan, source: Path, dest_root: Path) -> Path:
                 + "\n"
             )
 
-    removed = _remove_empty_dirs(source)
-    logger.info(f"Removed {removed} now-empty directories under {source}")
+    for source in sources:
+        removed = _remove_empty_dirs(source)
+        logger.info(f"Removed {removed} now-empty directories under {source}")
     return manifest_path
 
 
@@ -337,13 +362,16 @@ def _parse_args() -> argparse.Namespace:
         "see cleanup_migrated_s3.py for Phase 2, the S3-side cleanup).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("source", type=Path, help="Folder to reorganize (scanned recursively)")
+    parser.add_argument(
+        "sources", type=Path, nargs="+", metavar="SOURCE", help="Folder(s) to reorganize (scanned recursively, deduplicated across all of them)"
+    )
     parser.add_argument(
         "--dest-root",
         type=Path,
         default=None,
         metavar="PATH",
-        help="Where <year>/<month>/, _duplicates/, _unsorted/ are created (default: source's parent folder)",
+        help="Where <year>/<month>/, _duplicates/, _unsorted/ are created (default: the single "
+        "source's parent folder — required explicitly when passing more than one source)",
     )
     parser.add_argument("--execute", action="store_true", help="Actually move files (default: dry run, plan only)")
     parser.add_argument("--verbose", action="store_true", help="Show debug logging")
@@ -357,24 +385,31 @@ def main() -> None:
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
 
-    if not args.source.is_dir():
-        sys.exit(f"Error: source folder not found: {args.source}")
-    dest_root = args.dest_root or args.source.parent
+    for source in args.sources:
+        if not source.is_dir():
+            sys.exit(f"Error: source folder not found: {source}")
+
+    if args.dest_root:
+        dest_root = args.dest_root
+    elif len(args.sources) == 1:
+        dest_root = args.sources[0].parent
+    else:
+        sys.exit("Error: --dest-root is required when passing more than one source")
 
     if Image is None:
         logger.warning("Pillow not installed — EXIF dates unavailable, falling back to filename/mtime for images too")
 
     print("AWS Copier — Cellphone Backup Reorganizer")
-    print(f"Source: {args.source}")
+    print(f"Sources: {', '.join(str(s) for s in args.sources)}")
 
-    plan = build_plan(args.source, dest_root)
+    plan = build_plan(args.sources, dest_root)
     print_plan_summary(plan, dest_root)
 
     if not args.execute:
         print("\nDry run only — no files were moved. Pass --execute to apply this plan.")
         return
 
-    manifest_path = execute_plan(plan, args.source, dest_root)
+    manifest_path = execute_plan(plan, args.sources, dest_root)
     print(f"\nDone. {len(plan.keeps)} kept, {len(plan.duplicates)} quarantined as duplicates.")
     print(f"Manifest written to: {manifest_path}")
     print("Next: wait for the daemon's next periodic scan to re-upload the kept files at "
