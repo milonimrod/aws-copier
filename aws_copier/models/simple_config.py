@@ -53,6 +53,15 @@ class SimpleConfig:
         # Upload settings
         self.max_concurrent_uploads: int = kwargs.get("max_concurrent_uploads", 10)
 
+        # DEL-01: safety cap on how many files a single folder scan may propagate as
+        # deletions to S3 in one pass. Protects against a transient directory-listing
+        # glitch (or any other false-positive "everything vanished" signal) cascading
+        # into mass S3 deletion — if a folder's tracked-but-now-missing count exceeds
+        # this, the scan logs a warning and skips deletion entirely for that folder
+        # rather than guessing. Deliberately conservative; raise it in config.yaml only
+        # if you're intentionally doing large bulk local deletions through a watched folder.
+        self.max_deletions_per_scan: int = kwargs.get("max_deletions_per_scan", 20)
+
         # Web dashboard settings
         self.web_port: int = int(kwargs.get("web_port", 8765))
         self.web_enabled: bool = bool(kwargs.get("web_enabled", True))
@@ -78,6 +87,7 @@ class SimpleConfig:
             "s3_prefix": self.s3_prefix,
             "watch_folders": {str(folder_path): s3_name for folder_path, s3_name in self.folder_s3_mapping.items()},
             "max_concurrent_uploads": self.max_concurrent_uploads,
+            "max_deletions_per_scan": self.max_deletions_per_scan,
         }
 
         config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -106,6 +116,7 @@ class SimpleConfig:
             "s3_prefix": self.s3_prefix,
             "watch_folders": {str(folder_path): s3_name for folder_path, s3_name in self.folder_s3_mapping.items()},
             "max_concurrent_uploads": self.max_concurrent_uploads,
+            "max_deletions_per_scan": self.max_deletions_per_scan,
         }
 
 

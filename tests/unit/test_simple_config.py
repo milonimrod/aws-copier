@@ -16,6 +16,9 @@ def test_simple_config_creation():
     assert config.s3_bucket == "your-bucket-name"
     # Default lowered 100 -> 10 (see #9) to avoid S3 rate limit errors.
     assert config.max_concurrent_uploads == 10
+    # DEL-01: conservative default so a false "everything vanished" signal can't cascade
+    # into mass S3 deletion without a deliberate config change.
+    assert config.max_deletions_per_scan == 20
     assert len(config.watch_folders) == 1
 
 

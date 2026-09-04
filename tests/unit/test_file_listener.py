@@ -376,6 +376,119 @@ class TestFileListenerMoveReconciliation:
         assert updated_backup_info["files"]["photo.jpg"]["s3_key"] == old_s3_key
 
 
+class TestFileListenerDeletionPropagation:
+    """DEL-01: a file removed from a watched folder locally must be soft-deleted from S3
+    (not silently orphaned), but only when the scan can be trusted and the count of
+    apparently-deleted files stays under the safety cap.
+    """
+
+    def test_determine_files_to_delete_finds_missing_tracked_files(self, file_listener):
+        current_files = {"still_here.jpg": {"md5": "a"}}
+        existing_backup_info = {
+            "still_here.jpg": {"md5": "a", "s3_key": "k/still_here.jpg"},
+            "gone.jpg": {"md5": "b", "s3_key": "k/gone.jpg"},
+        }
+
+        result = file_listener._determine_files_to_delete(current_files, existing_backup_info)
+
+        assert result == ["gone.jpg"]
+
+    async def test_deleted_file_is_soft_deleted_and_dropped_from_backup_info(
+        self, file_listener, mock_s3_manager, temp_watch_folder
+    ):
+        folder = temp_watch_folder / "album"
+        folder.mkdir()
+        (folder / "keep.jpg").write_text("keep")
+        (folder / "gone.jpg").write_text("gone")
+        await file_listener._process_current_folder(folder)
+        assert mock_s3_manager.upload_file.await_count == 2
+
+        s3_folder_name = temp_watch_folder.name
+        gone_s3_key = f"{s3_folder_name}/album/gone.jpg"
+
+        (folder / "gone.jpg").unlink()
+        mock_s3_manager.upload_file.reset_mock()
+        mock_s3_manager.soft_delete_object.return_value = True
+
+        await file_listener._process_current_folder(folder)
+
+        mock_s3_manager.soft_delete_object.assert_awaited_once_with(gone_s3_key)
+        updated = json.loads((folder / ".milo_backup.info").read_text())
+        assert "gone.jpg" not in updated["files"]
+        assert "keep.jpg" in updated["files"]
+        assert file_listener.get_statistics()["deleted_files"] == 1
+
+    async def test_failed_soft_delete_keeps_entry_tracked_for_retry(
+        self, file_listener, mock_s3_manager, temp_watch_folder
+    ):
+        folder = temp_watch_folder / "album"
+        folder.mkdir()
+        (folder / "gone.jpg").write_text("gone")
+        await file_listener._process_current_folder(folder)
+
+        (folder / "gone.jpg").unlink()
+        mock_s3_manager.upload_file.reset_mock()
+        mock_s3_manager.soft_delete_object.return_value = False  # simulate S3-side failure
+
+        await file_listener._process_current_folder(folder)
+
+        updated = json.loads((folder / ".milo_backup.info").read_text())
+        assert "gone.jpg" in updated["files"]  # not silently dropped — retried next scan
+
+    async def test_deletion_count_over_cap_is_not_propagated(
+        self, file_listener, mock_s3_manager, temp_watch_folder
+    ):
+        """DEL-01 safety cap: more apparent deletions than max_deletions_per_scan must be
+        treated as suspicious, not executed."""
+        file_listener.config.max_deletions_per_scan = 2
+        folder = temp_watch_folder / "album"
+        folder.mkdir()
+        filenames = ["a.jpg", "b.jpg", "c.jpg"]
+        for name in filenames:
+            (folder / name).write_text(name)
+        await file_listener._process_current_folder(folder)
+
+        for name in filenames:
+            (folder / name).unlink()
+        mock_s3_manager.upload_file.reset_mock()
+        mock_s3_manager.soft_delete_object.return_value = True
+
+        await file_listener._process_current_folder(folder)
+
+        mock_s3_manager.soft_delete_object.assert_not_awaited()
+        updated = json.loads((folder / ".milo_backup.info").read_text())
+        assert set(updated["files"].keys()) == set(filenames)
+        assert file_listener.get_statistics()["deleted_files"] == 0
+
+    async def test_unreliable_directory_listing_never_triggers_deletion(
+        self, file_listener, mock_s3_manager, temp_watch_folder, monkeypatch
+    ):
+        """DEL-01 core safety property: if the folder can't be reliably listed this cycle,
+        nothing must be treated as deleted — even though every tracked file would appear
+        "missing" from an (incorrectly) empty scan result."""
+        folder = temp_watch_folder / "album"
+        folder.mkdir()
+        (folder / "photo.jpg").write_text("photo")
+        await file_listener._process_current_folder(folder)
+        mock_s3_manager.upload_file.reset_mock()
+
+        real_iterdir = Path.iterdir
+
+        def flaky_iterdir(self):
+            if self == folder:
+                raise OSError("simulated transient listing failure")
+            return real_iterdir(self)
+
+        monkeypatch.setattr(Path, "iterdir", flaky_iterdir)
+
+        await file_listener._process_current_folder(folder)
+
+        mock_s3_manager.soft_delete_object.assert_not_awaited()
+        # .milo_backup.info must be completely untouched by the failed scan.
+        updated = json.loads((folder / ".milo_backup.info").read_text())
+        assert "photo.jpg" in updated["files"]
+
+
 class TestConcurrentFolderTraversal:
     """CONC-02: sibling folders are processed concurrently, throttled by folder_semaphore."""
 

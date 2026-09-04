@@ -114,6 +114,11 @@ class AWSCopierApp:
             # D-11: never raises; logs warning on failure and continues.
             await asyncio.wait_for(self.s3_manager.ensure_lifecycle_rule(), timeout=30)
 
+            # DEL-01: ensure the _trash/ expiration rule exists for soft-deleted objects
+            # (files removed from a watched folder locally — see FileListener deletion
+            # propagation). Never raises; logs warning on failure and continues.
+            await asyncio.wait_for(self.s3_manager.ensure_trash_lifecycle_rule(), timeout=30)
+
             # D-10: log credential source for audit trail (set by SimpleConfig per CONFIG-05).
             logger.info(f"AWS credentials loaded from: {self.config.credential_source}")
 

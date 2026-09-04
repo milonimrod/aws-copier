@@ -80,6 +80,7 @@ class FileListener:
             "uploaded_files": 0,
             "moved_files": 0,
             "skipped_files": 0,
+            "deleted_files": 0,
             "errors": 0,
         }
 
@@ -261,9 +262,15 @@ class FileListener:
         # Step 1: Load existing backup info
         existing_backup_info = await self._load_backup_info(backup_info_file)
 
-        # Step 2: Scan current files — pass existing_backup_info for PERF-01 mtime-skip
+        # Step 2: Scan current files — pass existing_backup_info for PERF-01 mtime-skip.
+        # DEL-01: a failed listing must never be mistaken for "the folder is now empty" —
+        # skip this folder entirely this cycle rather than risk treating every previously
+        # tracked file as deleted. _scan_current_files() already logged the failure.
         watch_root = self._resolve_watch_root(folder_path)
-        current_files = await self._scan_current_files(folder_path, existing_backup_info, watch_root)
+        try:
+            current_files = await self._scan_current_files(folder_path, existing_backup_info, watch_root)
+        except Exception:
+            return
 
         # Step 3: Compare with existing backup info — MOVE-01 splits changed content
         # (files_to_upload) from unchanged content at a stale S3 key (files_to_move).
@@ -278,41 +285,55 @@ class FileListener:
         # Step 4b (MOVE-01): reconcile renamed/moved files via server-side S3 copy
         moved_files = await self._move_files(files_to_move, existing_backup_info, folder_path)
 
-        # Step 5: Update backup info file with successfully uploaded/moved files
-        if uploaded_files or moved_files:
-            # Create updated backup info with only successfully uploaded/moved files
-            updated_backup_info: Dict[str, Any] = existing_backup_info.copy()
+        # Step 4c (DEL-01): propagate local deletions to S3 (soft-delete to _trash/), capped
+        # by max_deletions_per_scan — a folder with more "missing" files than the cap is
+        # treated as suspicious rather than a real bulk deletion, and none are propagated
+        # this cycle. They stay fully tracked and get retried every scan until the count
+        # drops back under the cap, or the cap is deliberately raised in config.yaml.
+        candidate_deletions = self._determine_files_to_delete(current_files, existing_backup_info)
+        if len(candidate_deletions) > self.config.max_deletions_per_scan:
+            logger.warning(
+                f"{folder_path}: {len(candidate_deletions)} previously tracked files are "
+                f"missing locally, exceeding max_deletions_per_scan="
+                f"{self.config.max_deletions_per_scan} — skipping S3 deletion propagation "
+                f"this cycle as a precaution. Raise max_deletions_per_scan in config.yaml "
+                f"if this bulk deletion was intentional."
+            )
+            files_to_delete: List[str] = []
+        else:
+            files_to_delete = candidate_deletions
+        deleted_files = await self._delete_files(files_to_delete, existing_backup_info, folder_path)
 
-            # Add/update entries for successfully uploaded files with upload-captured mtime (D-02)
-            for filename in uploaded_files:
-                entry = current_files.get(filename)
-                if entry is not None:
-                    current_md5 = entry.get("md5") if isinstance(entry, dict) else entry
-                    updated_backup_info[filename] = {
-                        "md5": current_md5,
-                        "mtime": upload_mtimes[filename],
-                        "s3_key": self._build_s3_key(folder_path / filename),
-                    }
+        # Step 5: rebuild backup info from scratch. This is the single point that decides
+        # what leaves .milo_backup.info (files whose S3 deletion actually succeeded) vs.
+        # what's carried forward unchanged (upload/move failures, and any "missing" file
+        # that wasn't — or couldn't be — propagated as a deletion this cycle).
+        updated_backup_info: Dict[str, Any] = {}
 
-            # MOVE-01: record the new (current) s3_key for successfully moved files — content
-            # and mtime are unchanged, only the S3 location was reconciled.
-            for filename in moved_files:
-                entry = current_files.get(filename)
-                if entry is not None:
-                    updated_backup_info[filename] = {
-                        "md5": entry.get("md5") if isinstance(entry, dict) else entry,
-                        "mtime": entry.get("mtime") if isinstance(entry, dict) else 0.0,
-                        "s3_key": self._build_s3_key(folder_path / filename),
-                    }
-
-            # Also include unchanged files that weren't uploaded or moved (still valid) —
-            # backfill s3_key so legacy/untracked entries pick it up going forward.
-            handled = set(uploaded_files) | set(moved_files)
-            for filename, entry in current_files.items():
-                if filename in files_to_upload or filename in files_to_move:
-                    continue  # covered above (or failed — leave existing_backup_info's copy)
-                if filename in handled:
-                    continue
+        for filename, entry in current_files.items():
+            if filename in uploaded_files:
+                # D-02: upload-captured mtime, not the scan-time one.
+                current_md5 = entry.get("md5") if isinstance(entry, dict) else entry
+                updated_backup_info[filename] = {
+                    "md5": current_md5,
+                    "mtime": upload_mtimes[filename],
+                    "s3_key": self._build_s3_key(folder_path / filename),
+                }
+            elif filename in moved_files:
+                # MOVE-01: content/mtime unchanged, only the S3 location was reconciled.
+                updated_backup_info[filename] = {
+                    "md5": entry.get("md5") if isinstance(entry, dict) else entry,
+                    "mtime": entry.get("mtime") if isinstance(entry, dict) else 0.0,
+                    "s3_key": self._build_s3_key(folder_path / filename),
+                }
+            elif filename in files_to_upload or filename in files_to_move:
+                # Attempted but failed — leave the existing (possibly stale) entry
+                # untouched rather than lose track of it; retried on the next scan.
+                if filename in existing_backup_info:
+                    updated_backup_info[filename] = existing_backup_info[filename]
+            else:
+                # Unchanged file, or a previously-untracked one just discovered — normal
+                # entry, backfilling s3_key for legacy/untracked entries along the way.
                 current_md5 = entry.get("md5") if isinstance(entry, dict) else entry
                 current_mtime = entry.get("mtime") if isinstance(entry, dict) else 0.0
                 updated_backup_info[filename] = {
@@ -321,29 +342,21 @@ class FileListener:
                     "s3_key": self._build_s3_key(folder_path / filename),
                 }
 
+        # DEL-01: a candidate deletion that wasn't actually propagated (over the safety cap,
+        # or the soft-delete call itself failed) must stay exactly as it was — never
+        # silently dropped, or the s3_key needed to find/clean it up later would be lost.
+        for filename in candidate_deletions:
+            if filename not in deleted_files:
+                updated_backup_info[filename] = existing_backup_info[filename]
+
+        if updated_backup_info != existing_backup_info:
             await self._update_backup_info(backup_info_file, updated_backup_info)
             logger.info(
                 f"Updated backup info for {folder_path}: {len(uploaded_files)} uploaded, "
-                f"{len(moved_files)} moved, {len(files_to_upload) - len(uploaded_files)} upload-failed, "
+                f"{len(moved_files)} moved, {len(deleted_files)} deleted, "
+                f"{len(files_to_upload) - len(uploaded_files)} upload-failed, "
                 f"{len(files_to_move) - len(moved_files)} move-failed"
             )
-        elif files_to_upload or files_to_move:
-            # Some files needed upload/move but none succeeded
-            logger.warning(f"No files uploaded or moved successfully in {folder_path}, backup info not updated")
-        else:
-            # No files needed upload or move, but update backup info to include any new
-            # unchanged files and backfill s3_key on legacy entries.
-            backfilled: Dict[str, Any] = {
-                filename: {
-                    "md5": entry.get("md5") if isinstance(entry, dict) else entry,
-                    "mtime": entry.get("mtime") if isinstance(entry, dict) else 0.0,
-                    "s3_key": self._build_s3_key(folder_path / filename),
-                }
-                for filename, entry in current_files.items()
-            }
-            if backfilled != existing_backup_info:
-                await self._update_backup_info(backup_info_file, backfilled)
-                logger.info(f"Updated backup info for {folder_path} with unchanged files")
 
     async def _load_backup_info(self, backup_info_file: Path) -> Dict[str, Dict[str, Any]]:
         """Load backup info with in-memory cache and silent format migration.
@@ -390,6 +403,10 @@ class FileListener:
     ) -> Dict[str, Dict[str, Any]]:
         """Scan current folder and compute MD5 for changed files; skip unchanged via mtime (PERF-01).
 
+        Raises:
+            Exception: if the directory itself cannot be listed (DEL-01) — deliberately not
+                swallowed, so the caller never mistakes an unreliable scan for an empty folder.
+
         Args:
             folder_path: Path to folder to scan
             existing_backup_info: Previously stored backup info dict (from _load_backup_info).
@@ -410,12 +427,25 @@ class FileListener:
         # CONFIG-06: build cascaded .backupignore spec for this folder (D-07, D-08)
         backupignore_spec = self._load_backupignore_spec(folder_path, watch_root)
 
+        # DEL-01: list the directory OUTSIDE the broad try/except below and let a failure
+        # here propagate to the caller, rather than being swallowed into a silently-empty
+        # current_files. _process_current_folder relies on this to distinguish "folder
+        # genuinely has zero files now" (safe to treat as real, including for deletion
+        # detection) from "we couldn't reliably list this folder this cycle" (must not be
+        # treated as evidence that files were deleted).
+        try:
+            entries = list(folder_path.iterdir())
+        except Exception as e:
+            logger.error(f"Error listing files in {folder_path}: {e}")
+            self._stats["errors"] += 1
+            raise
+
         current_files: Dict[str, Dict[str, Any]] = {}
 
         try:
             # Collect all files to process; apply mtime-skip before scheduling MD5 tasks
             files_to_hash: List[Path] = []
-            for file_path in folder_path.iterdir():
+            for file_path in entries:
                 if file_path.is_dir():
                     continue
                 # IGNORE-03: delegate to IGNORE_RULES; IGNORE-04: count ignored files in stats
@@ -838,6 +868,137 @@ class FileListener:
         logger.info(f"Completed S3 move reconciliation: {len(moved_files)} / {len(files_to_move)} files moved")
         return moved_files
 
+    def _determine_files_to_delete(
+        self, current_files: Dict[str, Any], existing_backup_info: Dict[str, Any]
+    ) -> List[str]:
+        """Find filenames that were tracked before but are no longer present locally.
+
+        DEL-01: caller must only call this with a current_files that came from a
+        successful (unraised) _scan_current_files() — an unreliable listing must never
+        reach here, since every previously-tracked-but-now-"missing" file would be
+        misread as a real local deletion.
+
+        Args:
+            current_files: This scan's actual on-disk files for the folder.
+            existing_backup_info: Previously recorded backup info for the folder.
+
+        Returns:
+            Filenames present in existing_backup_info but absent from current_files.
+        """
+        return [filename for filename in existing_backup_info if filename not in current_files]
+
+    async def _delete_single_file(self, filename: str, s3_key: str) -> bool:
+        """Soft-delete one file's S3 object (move to _trash/), under the upload semaphore.
+
+        DEL-01: shares upload_semaphore with regular uploads/moves — same bounded S3 API
+        work against the same bucket/rate limit, not a separate resource pool.
+
+        Args:
+            filename: Name of file being removed (for logging only)
+            s3_key: The file's recorded S3 key to soft-delete
+
+        Returns:
+            True if the soft-delete succeeded, False otherwise.
+        """
+        async with self.upload_semaphore:
+            try:
+                ok = await self.s3_manager.soft_delete_object(s3_key)
+                if not ok:
+                    logger.warning(f"Failed to soft-delete {filename}: {s3_key}")
+                return ok
+            except Exception as e:
+                logger.error(f"Error soft-deleting {filename}: {e}")
+                self._stats["errors"] += 1
+                return False
+
+    async def _delete_with_timeout(self, filename: str, s3_key: str) -> Tuple[str, bool]:
+        """Wrap a single soft-delete in asyncio.wait_for so its 300s window runs independently.
+
+        Args:
+            filename: Name of file being removed
+            s3_key: The file's recorded S3 key to soft-delete
+
+        Returns:
+            Tuple (filename, success_bool).
+        """
+        try:
+            ok = await asyncio.wait_for(self._delete_single_file(filename, s3_key), timeout=300)
+            return filename, bool(ok)
+        except asyncio.TimeoutError:
+            logger.error(f"Delete timeout for {filename} (5 minutes)")
+            self._stats["errors"] += 1
+            return filename, False
+        except Exception as e:
+            logger.error(f"Delete task failed for {filename}: {e}")
+            self._stats["errors"] += 1
+            return filename, False
+
+    async def _delete_files(
+        self, files_to_delete: List[str], existing_backup_info: Dict[str, Any], folder_path: Path
+    ) -> Set[str]:
+        """Propagate local file deletions to S3 concurrently, via soft-delete (DEL-01).
+
+        DEL-01: files vanished from a watched folder locally get their S3 object moved to
+        _trash/ (see S3Manager.soft_delete_object / ensure_trash_lifecycle_rule) rather than
+        hard-deleted — recoverable for ensure_trash_lifecycle_rule()'s expiration window in
+        case the deletion detection is ever wrong.
+
+        Callers must apply the max_deletions_per_scan safety cap BEFORE calling this — this
+        method itself performs no capping, it just executes whatever list it's given.
+
+        Args:
+            files_to_delete: Filenames tracked in existing_backup_info but no longer present
+                locally (from _determine_files_to_delete)
+            existing_backup_info: Existing backup info, used to look up each file's s3_key
+            folder_path: Folder these files used to live in, for logging only
+
+        Returns:
+            Set of filenames successfully soft-deleted. Filenames that fail stay in
+            .milo_backup.info and are retried on the next scan.
+        """
+        if not files_to_delete:
+            return set()
+
+        logger.info(f"Propagating {len(files_to_delete)} local deletion(s) in {folder_path} to S3 (soft-delete)")
+
+        tasks: List[asyncio.Task] = []
+        for filename in files_to_delete:
+            existing_entry = existing_backup_info.get(filename)
+            s3_key = existing_entry.get("s3_key") if isinstance(existing_entry, dict) else None
+            if not s3_key:
+                # Legacy entry with no recorded s3_key — nothing to soft-delete against;
+                # just let it drop from backup info below without touching S3.
+                continue
+            task = asyncio.create_task(
+                self._delete_with_timeout(filename, s3_key),
+                name=f"delete-{folder_path.name}-{filename}",
+            )
+            self._active_upload_tasks.add(task)
+            task.add_done_callback(self._active_upload_tasks.discard)
+            tasks.append(task)
+
+        if not tasks:
+            return set()
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        deleted_files: Set[str] = set()
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"Delete coroutine raised unexpectedly: {result}")
+                self._stats["errors"] += 1
+                continue
+            filename, ok = result
+            if ok:
+                deleted_files.add(filename)
+                self._stats["deleted_files"] += 1
+                logger.info(f"Deletion propagated to S3 (soft-delete): {filename}")
+            else:
+                logger.warning(f"Deletion propagation failed for: {filename}")
+
+        logger.info(f"Completed S3 deletion propagation: {len(deleted_files)} / {len(files_to_delete)} files")
+        return deleted_files
+
     def _build_s3_key(self, file_path: Path) -> str:
         """Build S3 key for a file path relative to watch folders.
 
@@ -954,6 +1115,7 @@ class FileListener:
             "uploaded_files": 0,
             "moved_files": 0,
             "skipped_files": 0,
+            "deleted_files": 0,
             "errors": 0,
         }
 

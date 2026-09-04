@@ -591,6 +591,77 @@ class S3Manager:
             logger.error(f"Unexpected error getting object info: {e}")
             return None
 
+    async def soft_delete_object(self, s3_key: str) -> bool:
+        """Move an object under the _trash/ prefix instead of deleting it outright.
+
+        DEL-01: used for automated deletion propagation (a local file vanished from a
+        watched folder) — a hard delete_object() would be unrecoverable if the deletion
+        detection is ever wrong (a scan glitch, a bug), whereas this gives a real
+        recovery window: the object survives under _trash/ until ensure_trash_lifecycle_rule()'s
+        expiration rule cleans it up (default 30 days).
+
+        Args:
+            s3_key: Prefix-less S3 key to soft-delete.
+
+        Returns:
+            True if the object was moved to _trash/, False on any failure.
+        """
+        return await self.move_object(s3_key, f"_trash/{s3_key}")
+
+    async def ensure_trash_lifecycle_rule(self, expiration_days: int = 30) -> None:
+        """Ensure an expiration rule exists for the _trash/ prefix used by soft_delete_object().
+
+        Unlike ensure_lifecycle_rule() (which skips entirely if ANY lifecycle rule already
+        exists, to never clobber external config), this one fetches whatever rules are
+        already there and appends its own if missing — since put_bucket_lifecycle_configuration
+        replaces the whole rule set, never just adds one. Never raises; logs and returns on
+        any error, same as ensure_lifecycle_rule().
+
+        Args:
+            expiration_days: Days after which a soft-deleted object under _trash/ is
+                permanently removed by S3 itself.
+        """
+        rule_id = "aws-copier-trash-expiration"
+        try:
+            client = await self._get_or_create_client()
+        except Exception as e:
+            logger.warning(f"Could not verify trash lifecycle rule: {e}. Soft-deleted objects will accumulate cost.")
+            return
+
+        existing_rules = []
+        try:
+            response = await client.get_bucket_lifecycle_configuration(Bucket=self.config.s3_bucket)
+            existing_rules = response.get("Rules", [])
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code", "") != "NoSuchLifecycleConfiguration":
+                logger.warning(
+                    f"Could not verify trash lifecycle rule: {e}. Soft-deleted objects will accumulate cost."
+                )
+                return
+        except Exception as e:
+            logger.warning(f"Could not verify trash lifecycle rule: {e}. Soft-deleted objects will accumulate cost.")
+            return
+
+        if any(rule.get("ID") == rule_id for rule in existing_rules):
+            logger.info(f"Trash lifecycle rule already present (ID={rule_id}). Skipping.")
+            return
+
+        merged_rules = existing_rules + [
+            {
+                "ID": rule_id,
+                "Status": "Enabled",
+                "Filter": {"Prefix": "_trash/"},
+                "Expiration": {"Days": expiration_days},
+            }
+        ]
+        try:
+            await client.put_bucket_lifecycle_configuration(
+                Bucket=self.config.s3_bucket, LifecycleConfiguration={"Rules": merged_rules}
+            )
+            logger.info(f"Trash lifecycle rule set: expire _trash/ objects after {expiration_days} days.")
+        except Exception as e:
+            logger.warning(f"Could not set trash lifecycle rule: {e}. Soft-deleted objects will accumulate cost.")
+
     async def delete_object(self, s3_key: str) -> bool:
         """Delete a single object from the bucket.
 

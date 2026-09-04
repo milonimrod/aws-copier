@@ -292,3 +292,81 @@ async def test_delete_object_failure_returns_false(mock_get_session, s3_manager)
     result = await s3_manager.delete_object("old/file.txt")
 
     assert result is False
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_object_moves_to_trash_prefix(s3_manager):
+    """soft_delete_object() is a thin wrapper: move to _trash/<key> via move_object()."""
+    s3_manager.move_object = AsyncMock(return_value=True)
+
+    result = await s3_manager.soft_delete_object("Pictures/album/photo.jpg")
+
+    assert result is True
+    s3_manager.move_object.assert_awaited_once_with("Pictures/album/photo.jpg", "_trash/Pictures/album/photo.jpg")
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_object_propagates_move_failure(s3_manager):
+    s3_manager.move_object = AsyncMock(return_value=False)
+
+    result = await s3_manager.soft_delete_object("Pictures/album/photo.jpg")
+
+    assert result is False
+
+
+@pytest.mark.asyncio
+@patch("aws_copier.core.s3_manager.get_session")
+async def test_ensure_trash_lifecycle_rule_creates_when_none_exists(mock_get_session, s3_manager):
+    from botocore.exceptions import ClientError
+
+    mock_s3_client = AsyncMock()
+    mock_s3_client.get_bucket_lifecycle_configuration.side_effect = ClientError(
+        {"Error": {"Code": "NoSuchLifecycleConfiguration"}}, "GetBucketLifecycleConfiguration"
+    )
+    mock_get_session.return_value = MagicMock()
+    s3_manager._s3_client = mock_s3_client
+
+    await s3_manager.ensure_trash_lifecycle_rule(expiration_days=30)
+
+    mock_s3_client.put_bucket_lifecycle_configuration.assert_awaited_once()
+    kwargs = mock_s3_client.put_bucket_lifecycle_configuration.await_args.kwargs
+    rules = kwargs["LifecycleConfiguration"]["Rules"]
+    assert len(rules) == 1
+    assert rules[0]["ID"] == "aws-copier-trash-expiration"
+    assert rules[0]["Filter"] == {"Prefix": "_trash/"}
+    assert rules[0]["Expiration"] == {"Days": 30}
+
+
+@pytest.mark.asyncio
+@patch("aws_copier.core.s3_manager.get_session")
+async def test_ensure_trash_lifecycle_rule_preserves_existing_rules(mock_get_session, s3_manager):
+    """Regression: must APPEND, never replace — put_bucket_lifecycle_configuration
+    overwrites the whole rule set, so an existing (e.g. multipart-abort) rule must survive."""
+    existing_rule = {"ID": "aws-copier-abort-incomplete-multipart", "Status": "Enabled"}
+    mock_s3_client = AsyncMock()
+    mock_s3_client.get_bucket_lifecycle_configuration.return_value = {"Rules": [existing_rule]}
+    mock_get_session.return_value = MagicMock()
+    s3_manager._s3_client = mock_s3_client
+
+    await s3_manager.ensure_trash_lifecycle_rule()
+
+    kwargs = mock_s3_client.put_bucket_lifecycle_configuration.await_args.kwargs
+    rules = kwargs["LifecycleConfiguration"]["Rules"]
+    assert existing_rule in rules
+    assert any(r["ID"] == "aws-copier-trash-expiration" for r in rules)
+
+
+@pytest.mark.asyncio
+@patch("aws_copier.core.s3_manager.get_session")
+async def test_ensure_trash_lifecycle_rule_is_idempotent(mock_get_session, s3_manager):
+    """Already present — must not call put (never overwrite unnecessarily)."""
+    mock_s3_client = AsyncMock()
+    mock_s3_client.get_bucket_lifecycle_configuration.return_value = {
+        "Rules": [{"ID": "aws-copier-trash-expiration", "Status": "Enabled"}]
+    }
+    mock_get_session.return_value = MagicMock()
+    s3_manager._s3_client = mock_s3_client
+
+    await s3_manager.ensure_trash_lifecycle_rule()
+
+    mock_s3_client.put_bucket_lifecycle_configuration.assert_not_awaited()
