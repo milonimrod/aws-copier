@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # overflow, and therefore silently missed events, a real risk on top of that). For a personal
 # backup tool, bounded periodic-scan latency is an acceptable tradeoff for removing an entire
 # class of bugs and the watchdog dependency outright, rather than patching around them.
-FULL_RESCAN_INTERVAL_SECONDS = 6 * 60 * 60
+FULL_RESCAN_INTERVAL_SECONDS = 24 * 60 * 60
 
 
 def _trim_memory() -> None:
@@ -147,16 +147,14 @@ class AWSCopierApp:
                 _trim_memory()
 
                 # RELIAB-01: periodic full rescan safety net — see module docstring above.
-                # Checked once per status-loop iteration (~every 4h), so the actual
-                # trigger can lag the exact 6h mark by up to that long (worst case ~10h
-                # between full rescans) — still fine since incidental activity (uploads
-                # triggered by the daemon's own scans) isn't the only thing this catches,
-                # but worth knowing if RELIAB-01's staleness tolerance ever gets stricter.
+                # Checked once per status-loop iteration (~every 6h), so the actual
+                # trigger can lag the exact 24h mark by up to that long (worst case ~30h
+                # between full rescans); acceptable for a personal backup tool.
                 await self._maybe_run_periodic_rescan()
 
-                # Wait for shutdown event or timeout (4 hours)
+                # Wait for shutdown event or timeout (6 hours)
                 try:
-                    await asyncio.wait_for(self.shutdown_event.wait(), timeout=4 * 60 * 60)
+                    await asyncio.wait_for(self.shutdown_event.wait(), timeout=6 * 60 * 60)
                     break  # Shutdown event was set
                 except asyncio.TimeoutError:
                     # Timeout reached, continue loop for next status update
