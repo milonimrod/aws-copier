@@ -147,13 +147,16 @@ class AWSCopierApp:
                 _trim_memory()
 
                 # RELIAB-01: periodic full rescan safety net — see module docstring above.
-                # Checked once per status-loop iteration (~every 30 min), so the actual
-                # trigger can lag the exact 6h mark by up to that long; negligible.
+                # Checked once per status-loop iteration (~every 4h), so the actual
+                # trigger can lag the exact 6h mark by up to that long (worst case ~10h
+                # between full rescans) — still fine since incidental activity (uploads
+                # triggered by the daemon's own scans) isn't the only thing this catches,
+                # but worth knowing if RELIAB-01's staleness tolerance ever gets stricter.
                 await self._maybe_run_periodic_rescan()
 
-                # Wait for shutdown event or timeout (30 minutes)
+                # Wait for shutdown event or timeout (4 hours)
                 try:
-                    await asyncio.wait_for(self.shutdown_event.wait(), timeout=1800)
+                    await asyncio.wait_for(self.shutdown_event.wait(), timeout=4 * 60 * 60)
                     break  # Shutdown event was set
                 except asyncio.TimeoutError:
                     # Timeout reached, continue loop for next status update
