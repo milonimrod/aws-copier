@@ -19,6 +19,14 @@ services:
       - PUID=1000
       - PGID=10
       - TZ=UTC
+      # aiofiles runs file reads/MD5 hashing through a background ThreadPoolExecutor
+      # (~10 threads on a 6-thread NAS). glibc gives each thread its own malloc arena by
+      # default, and malloc_trim(0) (see main.py's _trim_memory) mostly only reclaims the
+      # main arena — memory freed inside a thread's arena tends to stay pinned to that
+      # arena instead of going back to the OS. Capping arenas at 1 keeps idle RSS well
+      # below the peak from a large scan instead of it staying pinned for the process's
+      # life.
+      - MALLOC_ARENA_MAX=1
     volumes:
       # Credentials + watch_folders/S3 settings — see config.yaml. Read-only: the daemon
       # never needs to write to this file.
@@ -29,9 +37,38 @@ services:
       - /volume1/pictures:/data/pictures
       - /volume1/@home/tali/Photos/MobileBackup:/data/tali_mobile
       - /volume1/@home/Nimrod Milo/Photos/MobileBackup:/data/nimrod_mobile
+      - /volume1/@home/nimrod/Photos/MobileBackup:/data/nimrod2_mobile
       - /volume1/@home/daphna/Photos/MobileBackup:/data/daphna_mobile
 
     ports:
       # Live log/status dashboard (aws_copier/web/dashboard.py). Drop this mapping, or set
       # web_enabled: false in config.yaml, if you don't want it reachable from the LAN.
       - "8765:8765"
+
+  # Dedicated Tailscale sidecar — gives this service its own tailnet hostname
+  # (aws-copier.olm-pound.ts.net) via `tailscale serve` run inside the sidecar itself,
+  # rather than sharing the NAS's main "tailscale" container's hostname. Waits for
+  # aws-copier to be started (no healthcheck defined on it, so that's the strongest
+  # depends_on condition available) so it doesn't race it on boot after a NAS restart.
+  ts-awscopier:
+    image: tailscale/tailscale:latest
+    container_name: ts-awscopier
+    restart: unless-stopped
+    depends_on:
+      aws-copier:
+        condition: service_started
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ts-awscopier-state:/var/lib/tailscale
+    environment:
+      - TS_HOSTNAME=aws-copier
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=false
+
+volumes:
+  ts-awscopier-state:
+    external: true
