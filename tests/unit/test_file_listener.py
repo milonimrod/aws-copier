@@ -967,6 +967,51 @@ class TestFileListenerAsyncBackupIO:
         data = json.loads(backup_file.read_text())
         assert data["files"] == new_format_files
 
+    async def test_update_backup_info_retries_on_permission_error_then_succeeds(
+        self, file_listener, tmp_path, monkeypatch
+    ):
+        """RACE-01: a transient PermissionError (e.g. another process briefly contending
+        for the same shared folder) is retried rather than losing the scan's state update."""
+        import aws_copier.core.file_listener as flmod
+
+        monkeypatch.setattr(flmod.asyncio, "sleep", AsyncMock())  # don't actually wait in tests
+
+        backup_file = tmp_path / ".milo_backup.info"
+        real_open = __import__("aiofiles").open
+        attempts = {"n": 0}
+
+        def flaky_open(*args, **kwargs):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise PermissionError("simulated transient contention")
+            return real_open(*args, **kwargs)
+
+        with patch("aws_copier.core.file_listener.aiofiles.open", side_effect=flaky_open):
+            ok = await file_listener._update_backup_info(backup_file, {"a.txt": {"md5": "x", "mtime": 1.0}})
+
+        assert ok is True
+        assert attempts["n"] == 3  # failed twice, succeeded on the 3rd attempt
+        assert backup_file.exists()
+
+    async def test_update_backup_info_gives_up_after_persistent_permission_error(
+        self, file_listener, tmp_path, monkeypatch
+    ):
+        """If the PermissionError never clears, fail after the retry budget rather than hanging."""
+        import aws_copier.core.file_listener as flmod
+
+        monkeypatch.setattr(flmod.asyncio, "sleep", AsyncMock())
+
+        backup_file = tmp_path / ".milo_backup.info"
+        with patch(
+            "aws_copier.core.file_listener.aiofiles.open",
+            side_effect=PermissionError("persistent contention"),
+        ) as mock_open:
+            ok = await file_listener._update_backup_info(backup_file, {"a.txt": {"md5": "x", "mtime": 1.0}})
+
+        assert ok is False
+        assert mock_open.call_count == 3  # exhausted all retry attempts
+        assert not backup_file.exists()
+
     async def test_folder_lock_is_same_instance_per_folder(self, file_listener, tmp_path):
         """_get_folder_lock returns the same Lock instance for the same folder path."""
         lock_a = file_listener._get_folder_lock(tmp_path)

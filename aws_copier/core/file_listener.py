@@ -1039,18 +1039,37 @@ class FileListener:
             True if the write succeeded, False otherwise.
         """
         backup_info = {"timestamp": datetime.now().isoformat(), "files": backup_files}
-        try:
-            async with self._get_folder_lock(backup_info_file.parent):
-                async with aiofiles.open(backup_info_file, "w", encoding="utf-8") as f:
-                    await f.write(json.dumps(backup_info, indent=2))
-                # PERF-02: update cache with new content; invalidate cached disk mtime so the
-                # next _load_backup_info re-stats and picks up the OS-assigned mtime after write.
-                self._backup_info_cache[backup_info_file.parent] = backup_files
-                self._backup_info_mtime.pop(backup_info_file.parent, None)
-            return True
-        except Exception as e:
-            logger.error(f"Failed to update backup info {backup_info_file}: {e}")
-            return False
+        # RACE-01: a folder also written to by something else outside this process (e.g. a
+        # NAS's own native backup app syncing into the same shared directory) can
+        # transiently win a write race against this file, surfacing as PermissionError.
+        # It's observed to clear within seconds on its own, so retry a couple of times
+        # before giving up rather than losing this scan's state update outright - any
+        # other exception still fails immediately, unchanged.
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with self._get_folder_lock(backup_info_file.parent):
+                    async with aiofiles.open(backup_info_file, "w", encoding="utf-8") as f:
+                        await f.write(json.dumps(backup_info, indent=2))
+                    # PERF-02: update cache with new content; invalidate cached disk mtime so
+                    # the next _load_backup_info re-stats and picks up the OS-assigned mtime.
+                    self._backup_info_cache[backup_info_file.parent] = backup_files
+                    self._backup_info_mtime.pop(backup_info_file.parent, None)
+                return True
+            except PermissionError as e:
+                if attempt < max_attempts:
+                    logger.warning(
+                        f"Permission denied updating backup info {backup_info_file} "
+                        f"(attempt {attempt}/{max_attempts}, will retry): {e}"
+                    )
+                    await asyncio.sleep(2 * attempt)
+                    continue
+                logger.error(f"Failed to update backup info {backup_info_file} after {max_attempts} attempts: {e}")
+                return False
+            except Exception as e:
+                logger.error(f"Failed to update backup info {backup_info_file}: {e}")
+                return False
+        return False
 
     async def _calculate_md5_with_semaphore(self, file_path: Path) -> Optional[str]:
         """Calculate MD5 hash of a file with semaphore control for parallel processing.
