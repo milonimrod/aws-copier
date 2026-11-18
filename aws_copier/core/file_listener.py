@@ -758,7 +758,9 @@ class FileListener:
         logger.info(f"Completed concurrent upload: {len(uploaded_files)} / {len(files_to_upload)} files uploaded")
         return uploaded_files
 
-    async def _move_single_file(self, filename: str, old_s3_key: str, new_s3_key: str) -> bool:
+    async def _move_single_file(
+        self, filename: str, old_s3_key: str, new_s3_key: str, local_path: Optional[Path] = None
+    ) -> bool:
         """Reconcile one renamed/moved file via server-side S3 copy, under the upload semaphore.
 
         MOVE-01: shares upload_semaphore with regular uploads since both are bounded S3 API
@@ -768,13 +770,15 @@ class FileListener:
             filename: Name of file being reconciled (for logging only)
             old_s3_key: Stale key recorded in .milo_backup.info before the rename
             new_s3_key: Currently correct key for the file's present location
+            local_path: The file's current local path, re-uploaded from if the S3 source
+                is archived and can't be copied server-side (COST-01)
 
         Returns:
             True if the S3-side move succeeded, False otherwise.
         """
         async with self.upload_semaphore:
             try:
-                ok = await self.s3_manager.move_object(old_s3_key, new_s3_key)
+                ok = await self.s3_manager.move_object(old_s3_key, new_s3_key, local_path=local_path)
                 if not ok:
                     logger.warning(f"Failed to move {filename}: {old_s3_key} -> {new_s3_key}")
                 return ok
@@ -783,22 +787,35 @@ class FileListener:
                 self._stats["errors"] += 1
                 return False
 
-    async def _move_with_timeout(self, filename: str, old_s3_key: str, new_s3_key: str) -> Tuple[str, bool]:
-        """Wrap a single move in asyncio.wait_for so its 300s window runs independently (mirrors ASYNC-02).
+    async def _move_with_timeout(
+        self, filename: str, old_s3_key: str, new_s3_key: str, local_path: Optional[Path] = None
+    ) -> Tuple[str, bool]:
+        """Wrap a single move in asyncio.wait_for so its window runs independently (mirrors ASYNC-02).
+
+        The window is sized like an upload's (estimate_upload_timeout) since an archived
+        source is moved by re-uploading the local file (COST-01).
 
         Args:
             filename: Name of file being reconciled
             old_s3_key: Stale key recorded in .milo_backup.info before the rename
             new_s3_key: Currently correct key for the file's present location
+            local_path: The file's current local path
 
         Returns:
             Tuple (filename, success_bool).
         """
         try:
-            ok = await asyncio.wait_for(self._move_single_file(filename, old_s3_key, new_s3_key), timeout=300)
+            file_size = local_path.stat().st_size if local_path is not None else 0
+        except OSError:
+            file_size = 0
+        timeout = estimate_upload_timeout(file_size)
+        try:
+            ok = await asyncio.wait_for(
+                self._move_single_file(filename, old_s3_key, new_s3_key, local_path), timeout=timeout
+            )
             return filename, bool(ok)
         except asyncio.TimeoutError:
-            logger.error(f"Move timeout for {filename} (5 minutes)")
+            logger.error(f"Move timeout for {filename} ({timeout}s)")
             self._stats["errors"] += 1
             return filename, False
         except Exception as e:
@@ -839,7 +856,7 @@ class FileListener:
                 continue
             new_s3_key = self._build_s3_key(folder_path / filename)
             task = asyncio.create_task(
-                self._move_with_timeout(filename, old_s3_key, new_s3_key),
+                self._move_with_timeout(filename, old_s3_key, new_s3_key, folder_path / filename),
                 name=f"move-{folder_path.name}-{filename}",
             )
             self._active_upload_tasks.add(task)

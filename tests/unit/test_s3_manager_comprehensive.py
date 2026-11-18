@@ -400,6 +400,68 @@ class TestS3ManagerMoveObject:
         mock_client.delete_object.assert_not_called()
 
 
+    async def test_move_object_keeps_glacier_ir_storage_class(self, s3_manager):
+        """COST-01: copying a GLACIER_IR object must not land it back in STANDARD."""
+        mock_client = AsyncMock()
+        s3_manager._s3_client = mock_client
+
+        info = {"size": 1024, "storage_class": "GLACIER_IR"}
+        with patch.object(s3_manager, "get_object_info", return_value=info):
+            result = await s3_manager.move_object("Old/file.txt", "New/file.txt")
+
+        assert result is True
+        assert mock_client.copy_object.await_args.kwargs["StorageClass"] == "GLACIER_IR"
+
+    async def test_move_object_archived_reuploads_from_local(self, s3_manager, tmp_path):
+        """COST-01: a DEEP_ARCHIVE source can't be copied, so it's re-uploaded from the local file."""
+        mock_client = AsyncMock()
+        s3_manager._s3_client = mock_client
+        local = tmp_path / "file.txt"
+        local.write_text("content")
+
+        info = {"size": 7, "storage_class": "DEEP_ARCHIVE"}
+        with (
+            patch.object(s3_manager, "get_object_info", return_value=info),
+            patch.object(s3_manager, "upload_file", AsyncMock(return_value=True)) as mock_upload,
+            patch.object(s3_manager, "delete_object", AsyncMock(return_value=True)) as mock_delete,
+        ):
+            result = await s3_manager.move_object("Old/file.txt", "New/file.txt", local_path=local)
+
+        assert result is True
+        mock_client.copy_object.assert_not_called()
+        mock_upload.assert_awaited_once_with(local, "New/file.txt")
+        mock_delete.assert_awaited_once_with("Old/file.txt")
+
+    async def test_move_object_archived_without_local_file_fails(self, s3_manager):
+        """COST-01: an archived source with no local file to re-upload from fails without touching S3."""
+        mock_client = AsyncMock()
+        s3_manager._s3_client = mock_client
+
+        info = {"size": 7, "storage_class": "DEEP_ARCHIVE"}
+        with patch.object(s3_manager, "get_object_info", return_value=info):
+            result = await s3_manager.move_object("Old/file.txt", "New/file.txt")
+
+        assert result is False
+        mock_client.copy_object.assert_not_called()
+        mock_client.delete_object.assert_not_called()
+
+    async def test_move_object_archived_upload_failure_keeps_source(self, s3_manager, tmp_path):
+        """If the re-upload fails, the archived source must not be deleted (only copy in S3)."""
+        local = tmp_path / "file.txt"
+        local.write_text("content")
+
+        info = {"size": 7, "storage_class": "DEEP_ARCHIVE"}
+        with (
+            patch.object(s3_manager, "get_object_info", return_value=info),
+            patch.object(s3_manager, "upload_file", AsyncMock(return_value=False)),
+            patch.object(s3_manager, "delete_object", AsyncMock(return_value=True)) as mock_delete,
+        ):
+            result = await s3_manager.move_object("Old/file.txt", "New/file.txt", local_path=local)
+
+        assert result is False
+        mock_delete.assert_not_awaited()
+
+
 class TestEstimateUploadTimeout:
     """PERF-05: upload timeout scales with file size instead of a fixed 300s."""
 

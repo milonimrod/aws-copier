@@ -41,6 +41,11 @@ _MULTIPART_CONCURRENCY = 8
 # in-flight parts modest (_MULTIPART_CONCURRENCY x this = 128MB).
 _MULTIPART_CHUNK_SIZE = 16 * 1024 * 1024
 
+# COST-01: the bucket's lifecycle tiers objects STANDARD -> GLACIER_IR -> DEEP_ARCHIVE.
+# Objects in these classes can be listed/HEADed but not read or CopyObject'ed without a
+# restore first, so server-side moves of them must take a different path.
+_ARCHIVED_STORAGE_CLASSES = frozenset({"GLACIER", "DEEP_ARCHIVE"})
+
 
 def estimate_upload_timeout(file_size: int) -> int:
     """Scale an upload timeout with file size so large files aren't cut off mid-transfer.
@@ -107,9 +112,10 @@ class S3Manager:
         continue startup even if lifecycle rule cannot be set.
         D-12: If any AbortIncompleteMultipartUpload rule already exists (any
         DaysAfterInitiation), log info and skip. If other lifecycle rules exist but
-        none is AbortIncompleteMultipartUpload, log warning and skip — never overwrite
-        externally-set rules with put_bucket_lifecycle_configuration (which replaces
-        the entire lifecycle config, not a single rule).
+        none is AbortIncompleteMultipartUpload, append ours to them — never drop
+        externally-set rules, since put_bucket_lifecycle_configuration replaces the
+        entire lifecycle config, not a single rule. (Skipping in that case, as this
+        used to, left 92GB of orphaned parts billed for over a year.)
 
         Returns:
             None
@@ -123,13 +129,13 @@ class S3Manager:
             )
             return
 
-        existing_rules_present = False
+        existing_rules: list = []
         try:
             response = await client.get_bucket_lifecycle_configuration(
                 Bucket=self.config.s3_bucket
             )
-            for rule in response.get("Rules", []):
-                existing_rules_present = True
+            existing_rules = response.get("Rules", [])
+            for rule in existing_rules:
                 abort = rule.get("AbortIncompleteMultipartUpload")
                 if abort:
                     days = abort.get("DaysAfterInitiation", "?")
@@ -154,30 +160,19 @@ class S3Manager:
             )
             return
 
-        # D-12: never overwrite externally-set rules. If get returned other rules
-        # but none is AbortIncompleteMultipartUpload, warn and skip.
-        if existing_rules_present:
-            logger.warning(
-                "Could not verify multipart lifecycle rule: bucket has existing lifecycle "
-                "rules but none is AbortIncompleteMultipartUpload. "
-                "Incomplete uploads may accumulate cost."
-            )
-            return
-
-        # No lifecycle config at all → safe to create one.
+        # D-12: keep any externally-set rules, just add ours alongside them.
+        merged_rules = existing_rules + [
+            {
+                "ID": "aws-copier-abort-incomplete-multipart",
+                "Status": "Enabled",
+                "Filter": {"Prefix": ""},
+                "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1},
+            }
+        ]
         try:
             await client.put_bucket_lifecycle_configuration(
                 Bucket=self.config.s3_bucket,
-                LifecycleConfiguration={
-                    "Rules": [
-                        {
-                            "ID": "aws-copier-abort-incomplete-multipart",
-                            "Status": "Enabled",
-                            "Filter": {"Prefix": ""},
-                            "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1},
-                        }
-                    ]
-                },
+                LifecycleConfiguration={"Rules": merged_rules},
             )
             logger.info(
                 "S3 lifecycle rule set: AbortIncompleteMultipartUpload after 1 day."
@@ -580,6 +575,8 @@ class S3Manager:
                 "last_modified": response.get("LastModified"),
                 "etag": response.get("ETag", "").strip('"'),
                 "metadata": response.get("Metadata", {}),
+                # HeadObject omits StorageClass for STANDARD objects.
+                "storage_class": response.get("StorageClass", "STANDARD"),
             }
 
         except ClientError as e:
@@ -600,12 +597,24 @@ class S3Manager:
         recovery window: the object survives under _trash/ until ensure_trash_lifecycle_rule()'s
         expiration rule cleans it up (default 30 days).
 
+        COST-01: an archived object (DEEP_ARCHIVE/GLACIER) can't be copied to _trash/ without
+        a restore, so it is left in place instead — it stays recoverable indefinitely at
+        ~$0.001/GB-month, which is cheaper and safer than a hard delete.
+
         Args:
             s3_key: Prefix-less S3 key to soft-delete.
 
         Returns:
-            True if the object was moved to _trash/, False on any failure.
+            True if the object was moved to _trash/ (or left in place because it is
+            archived), False on any failure.
         """
+        info = await self.get_object_info(s3_key)
+        if info is not None and info.get("storage_class") in _ARCHIVED_STORAGE_CLASSES:
+            logger.info(
+                f"soft_delete_object: {s3_key} is in {info['storage_class']}; leaving it in place "
+                f"instead of moving it to _trash/"
+            )
+            return True
         return await self.move_object(s3_key, f"_trash/{s3_key}")
 
     async def ensure_trash_lifecycle_rule(self, expiration_days: int = 30) -> None:
@@ -642,15 +651,19 @@ class S3Manager:
             logger.warning(f"Could not verify trash lifecycle rule: {e}. Soft-deleted objects will accumulate cost.")
             return
 
-        if any(rule.get("ID") == rule_id for rule in existing_rules):
+        # soft_delete_object() keys go through _build_s3_key, so the trash lives under the
+        # configured s3_prefix — a bare "_trash/" filter never matched anything.
+        trash_prefix = self._build_s3_key("_trash/")
+        current = next((rule for rule in existing_rules if rule.get("ID") == rule_id), None)
+        if current is not None and current.get("Filter", {}).get("Prefix") == trash_prefix:
             logger.info(f"Trash lifecycle rule already present (ID={rule_id}). Skipping.")
             return
 
-        merged_rules = existing_rules + [
+        merged_rules = [rule for rule in existing_rules if rule.get("ID") != rule_id] + [
             {
                 "ID": rule_id,
                 "Status": "Enabled",
-                "Filter": {"Prefix": "_trash/"},
+                "Filter": {"Prefix": trash_prefix},
                 "Expiration": {"Days": expiration_days},
             }
         ]
@@ -685,7 +698,7 @@ class S3Manager:
             logger.error(f"Failed to delete S3 object {s3_key}: {e}")
             return False
 
-    async def move_object(self, source_key: str, dest_key: str) -> bool:
+    async def move_object(self, source_key: str, dest_key: str, local_path: Optional[Path] = None) -> bool:
         """Move an object within the bucket via server-side CopyObject, then delete the source.
 
         Used when a file's content is unchanged but its S3 key changed — typically because
@@ -693,20 +706,30 @@ class S3Manager:
         re-uploading the file's bytes; MetadataDirective="COPY" preserves the original
         md5-checksum metadata so the moved object still verifies correctly.
 
+        COST-01: the copy keeps the source's storage class (a GLACIER_IR object would
+        otherwise land back in STANDARD). An archived source (DEEP_ARCHIVE/GLACIER) can't
+        be copied without a restore, so it is re-uploaded from local_path instead.
+
         Args:
             source_key: Current (prefix-less) S3 key the object lives at.
             dest_key: New (prefix-less) S3 key it should live at.
+            local_path: Local copy of the file, used to re-upload an archived source.
 
         Returns:
-            True if the object was copied to dest_key and the source key removed,
-            False on any failure (including a source object over the 5GB single-call
-            CopyObject limit, or the source object not existing).
+            True if the object was copied (or re-uploaded) to dest_key and the source key
+            removed, False on any failure (including a source object over the 5GB
+            single-call CopyObject limit, the source object not existing, or an archived
+            source with no local_path to re-upload from).
         """
         try:
             info = await self.get_object_info(source_key)
             if info is None:
                 logger.warning(f"move_object: source key not found in S3: {source_key}")
                 return False
+
+            storage_class = info.get("storage_class", "STANDARD")
+            if storage_class in _ARCHIVED_STORAGE_CLASSES:
+                return await self._move_archived_object(source_key, dest_key, storage_class, local_path)
 
             if info["size"] > 5 * 1024 * 1024 * 1024:  # CopyObject single-call limit
                 logger.warning(
@@ -719,12 +742,16 @@ class S3Manager:
             full_dest_key = self._build_s3_key(dest_key)
             client = await self._get_or_create_client()
 
+            copy_kwargs: Dict[str, Any] = {}
+            if storage_class != "STANDARD":
+                copy_kwargs["StorageClass"] = storage_class
             await asyncio.wait_for(
                 client.copy_object(
                     Bucket=self.config.s3_bucket,
                     CopySource={"Bucket": self.config.s3_bucket, "Key": full_source_key},
                     Key=full_dest_key,
                     MetadataDirective="COPY",
+                    **copy_kwargs,
                 ),
                 timeout=300,
             )
@@ -738,6 +765,37 @@ class S3Manager:
         except Exception as e:
             logger.error(f"Failed to move S3 object {source_key} -> {dest_key}: {e}")
             return False
+
+    async def _move_archived_object(
+        self, source_key: str, dest_key: str, storage_class: str, local_path: Optional[Path]
+    ) -> bool:
+        """Move an archived object by re-uploading it from its local copy, then deleting the source.
+
+        Args:
+            source_key: Current (prefix-less) S3 key of the archived object.
+            dest_key: New (prefix-less) S3 key it should live at.
+            storage_class: The source object's storage class (for logging).
+            local_path: Local copy of the file to upload to dest_key.
+
+        Returns:
+            True if dest_key was uploaded and the source key removed, False otherwise.
+        """
+        if local_path is None or not local_path.is_file():
+            logger.warning(
+                f"move_object: {source_key} is in {storage_class} and cannot be copied without a "
+                f"restore, and no local file is available to re-upload from"
+            )
+            return False
+
+        if not await self.upload_file(local_path, dest_key):
+            logger.error(f"move_object: re-upload of archived {source_key} to {dest_key} failed")
+            return False
+
+        # The destination now holds the content, so removing the archived source is safe.
+        if not await self.delete_object(source_key):
+            logger.warning(f"move_object: re-uploaded to {dest_key} but could not delete archived {source_key}")
+        logger.debug(f"Moved archived S3 object by re-upload: {source_key} -> {dest_key}")
+        return True
 
 
 async def main():

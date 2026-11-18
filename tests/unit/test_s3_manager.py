@@ -297,6 +297,7 @@ async def test_delete_object_failure_returns_false(mock_get_session, s3_manager)
 @pytest.mark.asyncio
 async def test_soft_delete_object_moves_to_trash_prefix(s3_manager):
     """soft_delete_object() is a thin wrapper: move to _trash/<key> via move_object()."""
+    s3_manager.get_object_info = AsyncMock(return_value={"size": 1, "storage_class": "GLACIER_IR"})
     s3_manager.move_object = AsyncMock(return_value=True)
 
     result = await s3_manager.soft_delete_object("Pictures/album/photo.jpg")
@@ -307,11 +308,24 @@ async def test_soft_delete_object_moves_to_trash_prefix(s3_manager):
 
 @pytest.mark.asyncio
 async def test_soft_delete_object_propagates_move_failure(s3_manager):
+    s3_manager.get_object_info = AsyncMock(return_value={"size": 1, "storage_class": "STANDARD"})
     s3_manager.move_object = AsyncMock(return_value=False)
 
     result = await s3_manager.soft_delete_object("Pictures/album/photo.jpg")
 
     assert result is False
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_object_leaves_archived_object_in_place(s3_manager):
+    """COST-01: a DEEP_ARCHIVE object can't be copied to _trash/, so it's left where it is."""
+    s3_manager.get_object_info = AsyncMock(return_value={"size": 1, "storage_class": "DEEP_ARCHIVE"})
+    s3_manager.move_object = AsyncMock(return_value=True)
+
+    result = await s3_manager.soft_delete_object("Pictures/album/photo.jpg")
+
+    assert result is True
+    s3_manager.move_object.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -333,7 +347,8 @@ async def test_ensure_trash_lifecycle_rule_creates_when_none_exists(mock_get_ses
     rules = kwargs["LifecycleConfiguration"]["Rules"]
     assert len(rules) == 1
     assert rules[0]["ID"] == "aws-copier-trash-expiration"
-    assert rules[0]["Filter"] == {"Prefix": "_trash/"}
+    # Trash keys go through _build_s3_key, so the filter must include the s3_prefix.
+    assert rules[0]["Filter"] == {"Prefix": "test-prefix/_trash/"}
     assert rules[0]["Expiration"] == {"Days": 30}
 
 
@@ -362,7 +377,13 @@ async def test_ensure_trash_lifecycle_rule_is_idempotent(mock_get_session, s3_ma
     """Already present — must not call put (never overwrite unnecessarily)."""
     mock_s3_client = AsyncMock()
     mock_s3_client.get_bucket_lifecycle_configuration.return_value = {
-        "Rules": [{"ID": "aws-copier-trash-expiration", "Status": "Enabled"}]
+        "Rules": [
+            {
+                "ID": "aws-copier-trash-expiration",
+                "Status": "Enabled",
+                "Filter": {"Prefix": "test-prefix/_trash/"},
+            }
+        ]
     }
     mock_get_session.return_value = MagicMock()
     s3_manager._s3_client = mock_s3_client
@@ -370,3 +391,28 @@ async def test_ensure_trash_lifecycle_rule_is_idempotent(mock_get_session, s3_ma
     await s3_manager.ensure_trash_lifecycle_rule()
 
     mock_s3_client.put_bucket_lifecycle_configuration.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@patch("aws_copier.core.s3_manager.get_session")
+async def test_ensure_trash_lifecycle_rule_fixes_wrong_prefix(mock_get_session, s3_manager):
+    """Regression: an existing rule with a prefix-less "_trash/" filter never matched the
+    prefixed trash keys — it must be replaced, not treated as already present."""
+    other_rule = {"ID": "other", "Status": "Enabled"}
+    mock_s3_client = AsyncMock()
+    mock_s3_client.get_bucket_lifecycle_configuration.return_value = {
+        "Rules": [
+            other_rule,
+            {"ID": "aws-copier-trash-expiration", "Status": "Enabled", "Filter": {"Prefix": "_trash/"}},
+        ]
+    }
+    mock_get_session.return_value = MagicMock()
+    s3_manager._s3_client = mock_s3_client
+
+    await s3_manager.ensure_trash_lifecycle_rule()
+
+    rules = mock_s3_client.put_bucket_lifecycle_configuration.await_args.kwargs["LifecycleConfiguration"]["Rules"]
+    trash_rules = [r for r in rules if r["ID"] == "aws-copier-trash-expiration"]
+    assert len(trash_rules) == 1
+    assert trash_rules[0]["Filter"] == {"Prefix": "test-prefix/_trash/"}
+    assert other_rule in rules

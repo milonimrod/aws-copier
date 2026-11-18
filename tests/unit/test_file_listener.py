@@ -345,7 +345,9 @@ class TestFileListenerMoveReconciliation:
 
         # Content is unchanged, so this must be reconciled via server-side move, never a re-upload.
         mock_s3_manager.upload_file.assert_not_awaited()
-        mock_s3_manager.move_object.assert_awaited_once_with(old_s3_key, new_s3_key)
+        mock_s3_manager.move_object.assert_awaited_once_with(
+            old_s3_key, new_s3_key, local_path=new_dir / "photo.jpg"
+        )
 
         updated_backup_info = json.loads((new_dir / ".milo_backup.info").read_text())
         assert updated_backup_info["files"]["photo.jpg"]["s3_key"] == new_s3_key

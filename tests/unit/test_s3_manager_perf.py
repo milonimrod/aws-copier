@@ -180,8 +180,8 @@ class TestEnsureLifecycleRule:
         mock_client.put_bucket_lifecycle_configuration.assert_not_awaited()
         assert any("already present" in r.message and "DaysAfterInitiation=7" in r.message for r in caplog.records)
 
-    async def test_warns_and_skips_when_other_rules_but_no_abort(self, explicit_creds_config, caplog):
-        """When other lifecycle rules exist but no AbortIncomplete, warn and skip (D-12)."""
+    async def test_appends_rule_when_other_rules_but_no_abort(self, explicit_creds_config):
+        """When other lifecycle rules exist but no AbortIncomplete, append ours and keep theirs (D-12)."""
         s3 = S3Manager(explicit_creds_config)
         mock_client = AsyncMock()
         mock_client.get_bucket_lifecycle_configuration.return_value = {
@@ -195,10 +195,11 @@ class TestEnsureLifecycleRule:
             ]
         }
         with patch.object(s3, "_get_or_create_client", return_value=mock_client):
-            with caplog.at_level("WARNING"):
-                await s3.ensure_lifecycle_rule()
-        mock_client.put_bucket_lifecycle_configuration.assert_not_awaited()
-        assert any("Could not verify multipart lifecycle rule" in r.message for r in caplog.records)
+            await s3.ensure_lifecycle_rule()
+        mock_client.put_bucket_lifecycle_configuration.assert_awaited_once()
+        rules = mock_client.put_bucket_lifecycle_configuration.call_args.kwargs["LifecycleConfiguration"]["Rules"]
+        assert [r["ID"] for r in rules] == ["transition-rule", "aws-copier-abort-incomplete-multipart"]
+        assert rules[0]["Transitions"] == [{"Days": 30, "StorageClass": "GLACIER"}]
 
     async def test_warns_and_returns_on_other_client_error(self, explicit_creds_config, caplog):
         """When a ClientError other than NoSuchLifecycleConfiguration is raised, warn and return."""
