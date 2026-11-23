@@ -290,7 +290,7 @@ class FileListener:
         # treated as suspicious rather than a real bulk deletion, and none are propagated
         # this cycle. They stay fully tracked and get retried every scan until the count
         # drops back under the cap, or the cap is deliberately raised in config.yaml.
-        candidate_deletions = self._determine_files_to_delete(current_files, existing_backup_info)
+        candidate_deletions = self._determine_files_to_delete(current_files, existing_backup_info, folder_path)
         if len(candidate_deletions) > self.config.max_deletions_per_scan:
             logger.warning(
                 f"{folder_path}: {len(candidate_deletions)} previously tracked files are "
@@ -342,12 +342,14 @@ class FileListener:
                     "s3_key": self._build_s3_key(folder_path / filename),
                 }
 
-        # DEL-01: a candidate deletion that wasn't actually propagated (over the safety cap,
-        # or the soft-delete call itself failed) must stay exactly as it was — never
-        # silently dropped, or the s3_key needed to find/clean it up later would be lost.
-        for filename in candidate_deletions:
-            if filename not in deleted_files:
-                updated_backup_info[filename] = existing_backup_info[filename]
+        # DEL-01 / SAFE-01: every existing entry that wasn't rebuilt above and wasn't actually
+        # deleted from S3 must stay exactly as it was — a candidate deletion that wasn't
+        # propagated (over the safety cap, or the soft-delete call failed), and a file that
+        # still exists locally but wasn't captured this scan (hash error, newly ignored).
+        # Dropping any of them would lose the s3_key needed to find/clean it up later.
+        for filename, entry in existing_backup_info.items():
+            if filename not in updated_backup_info and filename not in deleted_files:
+                updated_backup_info[filename] = entry
 
         if updated_backup_info != existing_backup_info:
             await self._update_backup_info(backup_info_file, updated_backup_info)
@@ -886,23 +888,33 @@ class FileListener:
         return moved_files
 
     def _determine_files_to_delete(
-        self, current_files: Dict[str, Any], existing_backup_info: Dict[str, Any]
+        self, current_files: Dict[str, Any], existing_backup_info: Dict[str, Any], folder_path: Path
     ) -> List[str]:
-        """Find filenames that were tracked before but are no longer present locally.
+        """Find filenames that were tracked before but no longer exist locally.
 
         DEL-01: caller must only call this with a current_files that came from a
         successful (unraised) _scan_current_files() — an unreliable listing must never
         reach here, since every previously-tracked-but-now-"missing" file would be
         misread as a real local deletion.
 
+        SAFE-01: being absent from current_files is NOT proof of deletion — a file whose
+        MD5 failed, or that a new .backupignore line now matches, is absent from it too
+        while still sitting on disk. Only a file that really isn't there anymore counts.
+
         Args:
-            current_files: This scan's actual on-disk files for the folder.
+            current_files: This scan's captured files for the folder.
             existing_backup_info: Previously recorded backup info for the folder.
+            folder_path: Folder being scanned, used to confirm a "missing" file is gone.
 
         Returns:
-            Filenames present in existing_backup_info but absent from current_files.
+            Filenames present in existing_backup_info, absent from current_files, and
+            absent from disk.
         """
-        return [filename for filename in existing_backup_info if filename not in current_files]
+        return [
+            filename
+            for filename in existing_backup_info
+            if filename not in current_files and not (folder_path / filename).exists()
+        ]
 
     async def _delete_single_file(self, filename: str, s3_key: str) -> bool:
         """Soft-delete one file's S3 object (move to _trash/), under the upload semaphore.

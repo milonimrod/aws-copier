@@ -384,14 +384,14 @@ class TestFileListenerDeletionPropagation:
     apparently-deleted files stays under the safety cap.
     """
 
-    def test_determine_files_to_delete_finds_missing_tracked_files(self, file_listener):
+    def test_determine_files_to_delete_finds_missing_tracked_files(self, file_listener, temp_watch_folder):
         current_files = {"still_here.jpg": {"md5": "a"}}
         existing_backup_info = {
             "still_here.jpg": {"md5": "a", "s3_key": "k/still_here.jpg"},
             "gone.jpg": {"md5": "b", "s3_key": "k/gone.jpg"},
         }
 
-        result = file_listener._determine_files_to_delete(current_files, existing_backup_info)
+        result = file_listener._determine_files_to_delete(current_files, existing_backup_info, temp_watch_folder)
 
         assert result == ["gone.jpg"]
 
@@ -419,6 +419,57 @@ class TestFileListenerDeletionPropagation:
         assert "gone.jpg" not in updated["files"]
         assert "keep.jpg" in updated["files"]
         assert file_listener.get_statistics()["deleted_files"] == 1
+
+    async def test_hash_failure_does_not_soft_delete(self, file_listener, mock_s3_manager, temp_watch_folder):
+        """SAFE-01: a file that still exists but failed to hash this scan is not 'deleted'."""
+        folder = temp_watch_folder / "album"
+        folder.mkdir()
+        (folder / "a.jpg").write_text("a")
+        await file_listener._process_current_folder(folder)
+        mock_s3_manager.soft_delete_object.reset_mock()
+
+        # Force a re-hash (mtime changes) that then fails.
+        (folder / "a.jpg").write_text("a changed")
+        file_listener._backup_info_cache.clear()
+        file_listener._backup_info_mtime.clear()
+        file_listener._calculate_md5_sync = lambda _p: None
+
+        await file_listener._process_current_folder(folder)
+
+        mock_s3_manager.soft_delete_object.assert_not_awaited()
+        updated = json.loads((folder / ".milo_backup.info").read_text())
+        assert "a.jpg" in updated["files"]
+
+    async def test_newly_ignored_file_is_not_soft_deleted(self, file_listener, mock_s3_manager, temp_watch_folder):
+        """SAFE-01: adding a .backupignore line must not delete already-backed-up files from S3."""
+        folder = temp_watch_folder / "album"
+        folder.mkdir()
+        (folder / "clip.mov").write_text("video")
+        await file_listener._process_current_folder(folder)
+        mock_s3_manager.soft_delete_object.reset_mock()
+
+        (folder / ".backupignore").write_text("*.mov\n")
+
+        await file_listener._process_current_folder(folder)
+
+        mock_s3_manager.soft_delete_object.assert_not_awaited()
+        updated = json.loads((folder / ".milo_backup.info").read_text())
+        assert "clip.mov" in updated["files"]
+
+    async def test_already_gone_s3_object_clears_entry(self, file_listener, mock_s3_manager, temp_watch_folder):
+        """SAFE-02: a deleted file whose S3 object is already gone must not stay tracked forever."""
+        folder = temp_watch_folder / "album"
+        folder.mkdir()
+        (folder / "gone.jpg").write_text("gone")
+        await file_listener._process_current_folder(folder)
+
+        (folder / "gone.jpg").unlink()
+        mock_s3_manager.soft_delete_object.return_value = True  # S3Manager: absent == success
+
+        await file_listener._process_current_folder(folder)
+
+        updated = json.loads((folder / ".milo_backup.info").read_text())
+        assert "gone.jpg" not in updated["files"]
 
     async def test_failed_soft_delete_keeps_entry_tracked_for_retry(
         self, file_listener, mock_s3_manager, temp_watch_folder

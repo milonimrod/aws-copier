@@ -562,31 +562,31 @@ class S3Manager:
             s3_key: S3 object key
 
         Returns:
-            Object metadata dict or None if not found
+            Object metadata dict, or None if the object definitely does not exist.
+
+        Raises:
+            Exception: on any error other than a 404 (SAFE-02/SAFE-03: callers must be able
+                to tell "confirmed missing" from "could not check" — a network error or
+                throttle must never be read as "the object is gone").
         """
+        full_s3_key = self._build_s3_key(s3_key)
+        client = await self._get_or_create_client()
         try:
-            full_s3_key = self._build_s3_key(s3_key)
-
-            client = await self._get_or_create_client()
             response = await client.head_object(Bucket=self.config.s3_bucket, Key=full_s3_key)
-
-            return {
-                "size": response.get("ContentLength", 0),
-                "last_modified": response.get("LastModified"),
-                "etag": response.get("ETag", "").strip('"'),
-                "metadata": response.get("Metadata", {}),
-                # HeadObject omits StorageClass for STANDARD objects.
-                "storage_class": response.get("StorageClass", "STANDARD"),
-            }
-
         except ClientError as e:
-            if e.response["Error"]["Code"] == "404":
+            if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
                 return None
             logger.error(f"Error getting object info: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Unexpected error getting object info: {e}")
-            return None
+            raise
+
+        return {
+            "size": response.get("ContentLength", 0),
+            "last_modified": response.get("LastModified"),
+            "etag": response.get("ETag", "").strip('"'),
+            "metadata": response.get("Metadata", {}),
+            # HeadObject omits StorageClass for STANDARD objects.
+            "storage_class": response.get("StorageClass", "STANDARD"),
+        }
 
     async def soft_delete_object(self, s3_key: str) -> bool:
         """Move an object under the _trash/ prefix instead of deleting it outright.
@@ -605,11 +605,20 @@ class S3Manager:
             s3_key: Prefix-less S3 key to soft-delete.
 
         Returns:
-            True if the object was moved to _trash/ (or left in place because it is
-            archived), False on any failure.
+            True if the object was moved to _trash/, left in place because it is archived,
+            or was already absent; False on any failure (including a failed existence check).
         """
-        info = await self.get_object_info(s3_key)
-        if info is not None and info.get("storage_class") in _ARCHIVED_STORAGE_CLASSES:
+        try:
+            info = await self.get_object_info(s3_key)
+        except Exception as e:
+            logger.error(f"soft_delete_object: could not check {s3_key}: {e}")
+            return False
+        if info is None:
+            # SAFE-02: already gone (hard-deleted by a tool, lifecycle, or by hand). Report
+            # success so the stale entry leaves .milo_backup.info instead of retrying forever.
+            logger.info(f"soft_delete_object: {s3_key} is already absent from S3; nothing to move")
+            return True
+        if info.get("storage_class") in _ARCHIVED_STORAGE_CLASSES:
             logger.info(
                 f"soft_delete_object: {s3_key} is in {info['storage_class']}; leaving it in place "
                 f"instead of moving it to _trash/"
