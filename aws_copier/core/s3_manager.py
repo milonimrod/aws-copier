@@ -707,7 +707,9 @@ class S3Manager:
             logger.error(f"Failed to delete S3 object {s3_key}: {e}")
             return False
 
-    async def move_object(self, source_key: str, dest_key: str, local_path: Optional[Path] = None) -> bool:
+    async def move_object(
+        self, source_key: str, dest_key: str, local_path: Optional[Path] = None, delete_source: bool = True
+    ) -> bool:
         """Move an object within the bucket via server-side CopyObject, then delete the source.
 
         Used when a file's content is unchanged but its S3 key changed — typically because
@@ -723,10 +725,14 @@ class S3Manager:
             source_key: Current (prefix-less) S3 key the object lives at.
             dest_key: New (prefix-less) S3 key it should live at.
             local_path: Local copy of the file, used to re-upload an archived source.
+            delete_source: When False the source key is left in place (copy only). SAFE-04:
+                the caller passes False whenever the source's local file may still exist
+                (e.g. a copied folder dragged its stale .milo_backup.info along) — deleting
+                it would erase the original's only S3 copy.
 
         Returns:
-            True if the object was copied (or re-uploaded) to dest_key and the source key
-            removed, False on any failure (including a source object over the 5GB
+            True if the object was copied (or re-uploaded) to dest_key and, when
+            delete_source is set, the source key removed, False on any failure (including a source object over the 5GB
             single-call CopyObject limit, the source object not existing, or an archived
             source with no local_path to re-upload from).
         """
@@ -738,7 +744,9 @@ class S3Manager:
 
             storage_class = info.get("storage_class", "STANDARD")
             if storage_class in _ARCHIVED_STORAGE_CLASSES:
-                return await self._move_archived_object(source_key, dest_key, storage_class, local_path)
+                return await self._move_archived_object(
+                    source_key, dest_key, storage_class, local_path, delete_source=delete_source
+                )
 
             if info["size"] > 5 * 1024 * 1024 * 1024:  # CopyObject single-call limit
                 logger.warning(
@@ -764,11 +772,12 @@ class S3Manager:
                 ),
                 timeout=300,
             )
-            await asyncio.wait_for(
-                client.delete_object(Bucket=self.config.s3_bucket, Key=full_source_key),
-                timeout=30,
-            )
-            logger.debug(f"Moved S3 object: {full_source_key} -> {full_dest_key}")
+            if delete_source:
+                await asyncio.wait_for(
+                    client.delete_object(Bucket=self.config.s3_bucket, Key=full_source_key),
+                    timeout=30,
+                )
+            logger.debug(f"{'Moved' if delete_source else 'Copied'} S3 object: {full_source_key} -> {full_dest_key}")
             return True
 
         except Exception as e:
@@ -776,7 +785,12 @@ class S3Manager:
             return False
 
     async def _move_archived_object(
-        self, source_key: str, dest_key: str, storage_class: str, local_path: Optional[Path]
+        self,
+        source_key: str,
+        dest_key: str,
+        storage_class: str,
+        local_path: Optional[Path],
+        delete_source: bool = True,
     ) -> bool:
         """Move an archived object by re-uploading it from its local copy, then deleting the source.
 
@@ -799,6 +813,10 @@ class S3Manager:
         if not await self.upload_file(local_path, dest_key):
             logger.error(f"move_object: re-upload of archived {source_key} to {dest_key} failed")
             return False
+
+        if not delete_source:
+            logger.debug(f"Copied archived S3 object by re-upload (source kept): {source_key} -> {dest_key}")
+            return True
 
         # The destination now holds the content, so removing the archived source is safe.
         if not await self.delete_object(source_key):

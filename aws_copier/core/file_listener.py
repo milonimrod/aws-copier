@@ -285,6 +285,21 @@ class FileListener:
         # Step 4b (MOVE-01): reconcile renamed/moved files via server-side S3 copy
         moved_files = await self._move_files(files_to_move, existing_backup_info, folder_path)
 
+        # Step 4b' (SAFE-03): a move whose S3 source is confirmed gone can never succeed, and
+        # the file isn't in files_to_upload — without this it would retry forever and never be
+        # backed up at its new key. Transient failures (source still exists) are NOT re-uploaded.
+        failed_moves = [f for f in files_to_move if f not in moved_files]
+        orphaned = []
+        for filename in failed_moves:
+            old_key = (existing_backup_info.get(filename) or {}).get("s3_key")
+            if old_key and await self._source_confirmed_missing(old_key):
+                orphaned.append(filename)
+        if orphaned:
+            logger.info(f"{folder_path}: move source gone from S3 for {len(orphaned)} file(s); uploading instead")
+            extra_mtimes = await self._upload_files(orphaned, folder_path)
+            upload_mtimes.update(extra_mtimes)
+            uploaded_files.extend(extra_mtimes.keys())
+
         # Step 4c (DEL-01): propagate local deletions to S3 (soft-delete to _trash/), capped
         # by max_deletions_per_scan — a folder with more "missing" files than the cap is
         # treated as suspicious rather than a real bulk deletion, and none are propagated
@@ -780,7 +795,14 @@ class FileListener:
         """
         async with self.upload_semaphore:
             try:
-                ok = await self.s3_manager.move_object(old_s3_key, new_s3_key, local_path=local_path)
+                # SAFE-04: only delete the source key when its local file is known to be gone
+                # (a real rename). If it still exists — or the mapping is unknown — this is a
+                # copied folder, and the source key is that other file's only S3 copy.
+                old_local = self._local_path_for_s3_key(old_s3_key)
+                delete_source = old_local is not None and not old_local.exists()
+                ok = await self.s3_manager.move_object(
+                    old_s3_key, new_s3_key, local_path=local_path, delete_source=delete_source
+                )
                 if not ok:
                     logger.warning(f"Failed to move {filename}: {old_s3_key} -> {new_s3_key}")
                 return ok
@@ -1027,6 +1049,42 @@ class FileListener:
 
         logger.info(f"Completed S3 deletion propagation: {len(deleted_files)} / {len(files_to_delete)} files")
         return deleted_files
+
+    def _local_path_for_s3_key(self, s3_key: str) -> Optional[Path]:
+        """Map a (prefix-less) S3 key back to the local path it was uploaded from.
+
+        SAFE-04: the inverse of _build_s3_key, used to tell whether the file a stale s3_key
+        points at still exists locally.
+
+        Args:
+            s3_key: Prefix-less S3 key, as recorded in .milo_backup.info
+
+        Returns:
+            The local Path, or None when no watch folder matches or the mapping is ambiguous
+            (two watch folders sharing one S3 name) — callers must treat None as "unknown".
+        """
+        matches = []
+        for watch_folder in self.config.watch_folders:
+            s3_name = self.config.get_s3_name_for_folder(watch_folder)
+            if s3_key.startswith(f"{s3_name}/"):
+                matches.append(watch_folder / s3_key[len(s3_name) + 1 :])
+        return matches[0] if len(matches) == 1 else None
+
+    async def _source_confirmed_missing(self, s3_key: str) -> bool:
+        """True only when S3 definitively reports the object absent (SAFE-03).
+
+        Args:
+            s3_key: Prefix-less S3 key to check
+
+        Returns:
+            False when the object exists OR the check itself failed — a network error must
+            never be read as "the source is gone".
+        """
+        try:
+            return await self.s3_manager.get_object_info(s3_key) is None
+        except Exception as e:
+            logger.warning(f"Could not check whether {s3_key} exists in S3: {e}")
+            return False
 
     def _build_s3_key(self, file_path: Path) -> str:
         """Build S3 key for a file path relative to watch folders.

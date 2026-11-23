@@ -345,37 +345,109 @@ class TestFileListenerMoveReconciliation:
 
         # Content is unchanged, so this must be reconciled via server-side move, never a re-upload.
         mock_s3_manager.upload_file.assert_not_awaited()
+        # SAFE-04: the old local folder is gone, so this is a real rename -> source is deleted.
         mock_s3_manager.move_object.assert_awaited_once_with(
-            old_s3_key, new_s3_key, local_path=new_dir / "photo.jpg"
+            old_s3_key, new_s3_key, local_path=new_dir / "photo.jpg", delete_source=True
         )
 
         updated_backup_info = json.loads((new_dir / ".milo_backup.info").read_text())
         assert updated_backup_info["files"]["photo.jpg"]["s3_key"] == new_s3_key
         assert file_listener.get_statistics()["moved_files"] == 1
 
-    async def test_renamed_subdirectory_reupload_falls_back_when_move_fails(
-        self, file_listener, mock_s3_manager, temp_watch_folder
-    ):
-        """A failed S3-side move leaves the stale s3_key in place so the next scan retries it."""
+    async def _rename_tracked_folder(self, file_listener, temp_watch_folder):
         old_dir = temp_watch_folder / "album_old"
         old_dir.mkdir()
         (old_dir / "photo.jpg").write_text("photo content")
         await file_listener._process_current_folder(old_dir)
-
         new_dir = temp_watch_folder / "album_new"
         old_dir.rename(new_dir)
+        s3_name = temp_watch_folder.name
+        return new_dir, f"{s3_name}/album_old/photo.jpg", f"{s3_name}/album_new/photo.jpg"
+
+    async def test_transient_move_failure_keeps_stale_entry_and_does_not_reupload(
+        self, file_listener, mock_s3_manager, temp_watch_folder
+    ):
+        """A failed S3-side move whose source STILL exists leaves the stale s3_key so the next scan retries."""
+        new_dir, old_s3_key, _ = await self._rename_tracked_folder(file_listener, temp_watch_folder)
 
         mock_s3_manager.upload_file.reset_mock()
         mock_s3_manager.move_object.return_value = False  # simulate S3-side failure
+        mock_s3_manager.get_object_info.return_value = {"size": 1}  # source still exists
 
         await file_listener._process_current_folder(new_dir)
 
-        s3_folder_name = temp_watch_folder.name
-        old_s3_key = f"{s3_folder_name}/album_old/photo.jpg"
+        mock_s3_manager.upload_file.assert_not_awaited()
         updated_backup_info = json.loads((new_dir / ".milo_backup.info").read_text())
-        # Stale entry preserved (not silently marked as synced at the new key) so the next
-        # scan's _determine_files_to_upload still detects the mismatch and retries the move.
         assert updated_backup_info["files"]["photo.jpg"]["s3_key"] == old_s3_key
+
+    async def test_move_with_source_gone_from_s3_falls_back_to_upload(
+        self, file_listener, mock_s3_manager, temp_watch_folder
+    ):
+        """SAFE-03: source object confirmed absent -> upload at the new key in the same scan."""
+        new_dir, _, new_s3_key = await self._rename_tracked_folder(file_listener, temp_watch_folder)
+
+        mock_s3_manager.upload_file.reset_mock()
+        mock_s3_manager.move_object.return_value = False
+        mock_s3_manager.get_object_info.return_value = None  # old key definitely gone
+
+        await file_listener._process_current_folder(new_dir)
+
+        mock_s3_manager.upload_file.assert_awaited_once()
+        updated_backup_info = json.loads((new_dir / ".milo_backup.info").read_text())
+        assert updated_backup_info["files"]["photo.jpg"]["s3_key"] == new_s3_key
+
+    async def test_failed_existence_check_does_not_trigger_upload(
+        self, file_listener, mock_s3_manager, temp_watch_folder
+    ):
+        """SAFE-03: if we can't tell whether the source exists, never assume it's gone."""
+        new_dir, old_s3_key, _ = await self._rename_tracked_folder(file_listener, temp_watch_folder)
+
+        mock_s3_manager.upload_file.reset_mock()
+        mock_s3_manager.move_object.return_value = False
+        mock_s3_manager.get_object_info.side_effect = RuntimeError("network down")
+
+        await file_listener._process_current_folder(new_dir)
+
+        mock_s3_manager.upload_file.assert_not_awaited()
+        updated_backup_info = json.loads((new_dir / ".milo_backup.info").read_text())
+        assert updated_backup_info["files"]["photo.jpg"]["s3_key"] == old_s3_key
+
+    async def test_copied_folder_never_deletes_original_s3_object(
+        self, file_listener, mock_s3_manager, temp_watch_folder
+    ):
+        """SAFE-04: `cp -r A B` carries A's stale .milo_backup.info into B; B must not erase A's S3 copy."""
+        import shutil
+
+        src = temp_watch_folder / "album_a"
+        src.mkdir()
+        (src / "photo.jpg").write_text("photo content")
+        await file_listener._process_current_folder(src)
+
+        copy = temp_watch_folder / "album_b"
+        shutil.copytree(src, copy)  # includes the hidden .milo_backup.info with A's s3_key
+        mock_s3_manager.move_object.return_value = True
+
+        await file_listener._process_current_folder(copy)
+
+        s3_name = temp_watch_folder.name
+        mock_s3_manager.move_object.assert_awaited_once_with(
+            f"{s3_name}/album_a/photo.jpg",
+            f"{s3_name}/album_b/photo.jpg",
+            local_path=copy / "photo.jpg",
+            delete_source=False,
+        )
+
+    def test_local_path_for_s3_key_round_trips_and_rejects_unknown(self, file_listener, temp_watch_folder):
+        file_path = temp_watch_folder / "a" / "b.jpg"
+        key = file_listener._build_s3_key(file_path)
+        assert file_listener._local_path_for_s3_key(key) == file_path
+        assert file_listener._local_path_for_s3_key("NotAWatchFolder/x.jpg") is None
+
+    def test_local_path_for_s3_key_is_none_when_two_roots_share_a_name(self, file_listener, temp_watch_folder):
+        other = temp_watch_folder.parent / "other_root"
+        file_listener.config.watch_folders.append(other)
+        file_listener.config.folder_s3_mapping[other] = temp_watch_folder.name
+        assert file_listener._local_path_for_s3_key(f"{temp_watch_folder.name}/x.jpg") is None
 
 
 class TestFileListenerDeletionPropagation:

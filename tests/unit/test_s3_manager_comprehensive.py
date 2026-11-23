@@ -362,6 +362,33 @@ class TestS3ManagerMoveObject:
         )
         mock_client.delete_object.assert_awaited_once_with(Bucket="test-bucket", Key="backup/OldFolder/file.txt")
 
+    async def test_move_object_copy_only_keeps_source(self, s3_manager):
+        """SAFE-04: delete_source=False copies but never deletes the source key."""
+        mock_client = AsyncMock()
+        s3_manager._s3_client = mock_client
+
+        with patch.object(s3_manager, "get_object_info", return_value={"size": 1024}):
+            result = await s3_manager.move_object("A/file.txt", "B/file.txt", delete_source=False)
+
+        assert result is True
+        mock_client.copy_object.assert_awaited_once()
+        mock_client.delete_object.assert_not_called()
+
+    async def test_move_object_archived_copy_only_keeps_source(self, s3_manager, tmp_path):
+        """SAFE-04: the archived re-upload path also honors delete_source=False."""
+        local = tmp_path / "file.txt"
+        local.write_text("content")
+        info = {"size": 7, "storage_class": "DEEP_ARCHIVE"}
+        with (
+            patch.object(s3_manager, "get_object_info", return_value=info),
+            patch.object(s3_manager, "upload_file", AsyncMock(return_value=True)),
+            patch.object(s3_manager, "delete_object", AsyncMock(return_value=True)) as mock_delete,
+        ):
+            result = await s3_manager.move_object("A/file.txt", "B/file.txt", local_path=local, delete_source=False)
+
+        assert result is True
+        mock_delete.assert_not_awaited()
+
     async def test_move_object_source_not_found(self, s3_manager):
         """A missing source object fails the move without attempting copy or delete."""
         mock_client = AsyncMock()
