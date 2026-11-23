@@ -88,3 +88,27 @@
 | CONFIG-05 | Phase 2 | Pending |
 | CONFIG-06 | Phase 2 | Pending |
 | CONFIG-07 | Phase 2 | Pending |
+
+---
+
+## v2 Requirements — Audit Hardening Milestone (Phase 3, from the 2026-11-23 ponytail audit)
+
+- [ ] **TEST-01**: Lifecycle tests never bind the real dashboard port; suite is green while port 8765 is busy
+- [ ] **SAFE-01**: A tracked file is deleted from S3 only when it no longer exists locally; hash failures and ignore-rule matches keep the entry (audit #3)
+- [ ] **SAFE-02**: Soft-deleting a key whose S3 object is already gone succeeds, so the entry leaves `.milo_backup.info` (audit #5)
+- [ ] **SAFE-03**: A failed move whose S3 source is confirmed absent falls back to a normal upload in the same scan (audit #2)
+- [ ] **SAFE-04**: A move never deletes the source key while the old local file still exists (copy-only) (audit #1)
+- [ ] **SCAN-01**: The recorded mtime is the one read before hashing, so a mid-hash edit is re-detected (audit #4)
+- [ ] **SCAN-02**: The scan's MD5 is reused for upload; a changed file is hashed once (audit #9)
+- [ ] **S3-01**: Upload verification compares real data (ETag for single-part) instead of self-written metadata (audit #12)
+- [ ] **DUR-01**: `.milo_backup.info` is written atomically (tmp + replace) and proven to work on the NAS mount (audit #6)
+- [ ] **HYG-01**: Dashboard is not exposed beyond what the user chooses (audit #10)
+- [ ] **HYG-02**: Dead `s3_manager.main()` dev harness that prints secrets is removed (audit #11)
+- [ ] **HYG-03**: Stale docstring in `delete_scattered_duplicates.py` corrected (audit #16)
+- [ ] **PERF-09**: Per-folder rebuild uses sets, not list membership (audit #13)
+- [ ] **PERF-10**: Directory listing and stat run off the event loop (audit #14)
+- [ ] **DEP-01**: Pillow becomes an optional extra; aiofiles replaced by `asyncio.to_thread` (audit #15)
+
+| REQ-ID | Phase | Status |
+|--------|-------|--------|
+| TEST-01, SAFE-01..04, SCAN-01..02, S3-01, DUR-01, HYG-01..03, PERF-09..10, DEP-01 | Phase 3 | Pending |
