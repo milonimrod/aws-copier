@@ -26,6 +26,7 @@ def _make_test_config(use_chain: bool) -> SimpleConfig:
             s3_bucket="test-bucket",
             s3_prefix="backup",
             watch_folders=["/tmp/aws-copier-test"],
+            web_enabled=False,  # TEST-01: never bind the real dashboard port
         )
     return SimpleConfig(
         aws_access_key_id="AKIA",
@@ -34,6 +35,7 @@ def _make_test_config(use_chain: bool) -> SimpleConfig:
         s3_bucket="test-bucket",
         s3_prefix="backup",
         watch_folders=["/tmp/aws-copier-test"],
+        web_enabled=False,  # TEST-01
     )
 
 
