@@ -345,37 +345,109 @@ class TestFileListenerMoveReconciliation:
 
         # Content is unchanged, so this must be reconciled via server-side move, never a re-upload.
         mock_s3_manager.upload_file.assert_not_awaited()
+        # SAFE-04: the old local folder is gone, so this is a real rename -> source is deleted.
         mock_s3_manager.move_object.assert_awaited_once_with(
-            old_s3_key, new_s3_key, local_path=new_dir / "photo.jpg"
+            old_s3_key, new_s3_key, local_path=new_dir / "photo.jpg", delete_source=True
         )
 
         updated_backup_info = json.loads((new_dir / ".milo_backup.info").read_text())
         assert updated_backup_info["files"]["photo.jpg"]["s3_key"] == new_s3_key
         assert file_listener.get_statistics()["moved_files"] == 1
 
-    async def test_renamed_subdirectory_reupload_falls_back_when_move_fails(
-        self, file_listener, mock_s3_manager, temp_watch_folder
-    ):
-        """A failed S3-side move leaves the stale s3_key in place so the next scan retries it."""
+    async def _rename_tracked_folder(self, file_listener, temp_watch_folder):
         old_dir = temp_watch_folder / "album_old"
         old_dir.mkdir()
         (old_dir / "photo.jpg").write_text("photo content")
         await file_listener._process_current_folder(old_dir)
-
         new_dir = temp_watch_folder / "album_new"
         old_dir.rename(new_dir)
+        s3_name = temp_watch_folder.name
+        return new_dir, f"{s3_name}/album_old/photo.jpg", f"{s3_name}/album_new/photo.jpg"
+
+    async def test_transient_move_failure_keeps_stale_entry_and_does_not_reupload(
+        self, file_listener, mock_s3_manager, temp_watch_folder
+    ):
+        """A failed S3-side move whose source STILL exists leaves the stale s3_key so the next scan retries."""
+        new_dir, old_s3_key, _ = await self._rename_tracked_folder(file_listener, temp_watch_folder)
 
         mock_s3_manager.upload_file.reset_mock()
         mock_s3_manager.move_object.return_value = False  # simulate S3-side failure
+        mock_s3_manager.get_object_info.return_value = {"size": 1}  # source still exists
 
         await file_listener._process_current_folder(new_dir)
 
-        s3_folder_name = temp_watch_folder.name
-        old_s3_key = f"{s3_folder_name}/album_old/photo.jpg"
+        mock_s3_manager.upload_file.assert_not_awaited()
         updated_backup_info = json.loads((new_dir / ".milo_backup.info").read_text())
-        # Stale entry preserved (not silently marked as synced at the new key) so the next
-        # scan's _determine_files_to_upload still detects the mismatch and retries the move.
         assert updated_backup_info["files"]["photo.jpg"]["s3_key"] == old_s3_key
+
+    async def test_move_with_source_gone_from_s3_falls_back_to_upload(
+        self, file_listener, mock_s3_manager, temp_watch_folder
+    ):
+        """SAFE-03: source object confirmed absent -> upload at the new key in the same scan."""
+        new_dir, _, new_s3_key = await self._rename_tracked_folder(file_listener, temp_watch_folder)
+
+        mock_s3_manager.upload_file.reset_mock()
+        mock_s3_manager.move_object.return_value = False
+        mock_s3_manager.get_object_info.return_value = None  # old key definitely gone
+
+        await file_listener._process_current_folder(new_dir)
+
+        mock_s3_manager.upload_file.assert_awaited_once()
+        updated_backup_info = json.loads((new_dir / ".milo_backup.info").read_text())
+        assert updated_backup_info["files"]["photo.jpg"]["s3_key"] == new_s3_key
+
+    async def test_failed_existence_check_does_not_trigger_upload(
+        self, file_listener, mock_s3_manager, temp_watch_folder
+    ):
+        """SAFE-03: if we can't tell whether the source exists, never assume it's gone."""
+        new_dir, old_s3_key, _ = await self._rename_tracked_folder(file_listener, temp_watch_folder)
+
+        mock_s3_manager.upload_file.reset_mock()
+        mock_s3_manager.move_object.return_value = False
+        mock_s3_manager.get_object_info.side_effect = RuntimeError("network down")
+
+        await file_listener._process_current_folder(new_dir)
+
+        mock_s3_manager.upload_file.assert_not_awaited()
+        updated_backup_info = json.loads((new_dir / ".milo_backup.info").read_text())
+        assert updated_backup_info["files"]["photo.jpg"]["s3_key"] == old_s3_key
+
+    async def test_copied_folder_never_deletes_original_s3_object(
+        self, file_listener, mock_s3_manager, temp_watch_folder
+    ):
+        """SAFE-04: `cp -r A B` carries A's stale .milo_backup.info into B; B must not erase A's S3 copy."""
+        import shutil
+
+        src = temp_watch_folder / "album_a"
+        src.mkdir()
+        (src / "photo.jpg").write_text("photo content")
+        await file_listener._process_current_folder(src)
+
+        copy = temp_watch_folder / "album_b"
+        shutil.copytree(src, copy)  # includes the hidden .milo_backup.info with A's s3_key
+        mock_s3_manager.move_object.return_value = True
+
+        await file_listener._process_current_folder(copy)
+
+        s3_name = temp_watch_folder.name
+        mock_s3_manager.move_object.assert_awaited_once_with(
+            f"{s3_name}/album_a/photo.jpg",
+            f"{s3_name}/album_b/photo.jpg",
+            local_path=copy / "photo.jpg",
+            delete_source=False,
+        )
+
+    def test_local_path_for_s3_key_round_trips_and_rejects_unknown(self, file_listener, temp_watch_folder):
+        file_path = temp_watch_folder / "a" / "b.jpg"
+        key = file_listener._build_s3_key(file_path)
+        assert file_listener._local_path_for_s3_key(key) == file_path
+        assert file_listener._local_path_for_s3_key("NotAWatchFolder/x.jpg") is None
+
+    def test_local_path_for_s3_key_is_none_when_two_roots_share_a_name(self, file_listener, temp_watch_folder):
+        other = temp_watch_folder.parent / "other_root"
+        file_listener.config.watch_folders.append(other)
+        file_listener.config.folder_s3_mapping[other] = temp_watch_folder.name
+        assert file_listener._local_path_for_s3_key(f"{temp_watch_folder.name}/x.jpg") is None
 
 
 class TestFileListenerDeletionPropagation:
@@ -384,14 +456,14 @@ class TestFileListenerDeletionPropagation:
     apparently-deleted files stays under the safety cap.
     """
 
-    def test_determine_files_to_delete_finds_missing_tracked_files(self, file_listener):
+    def test_determine_files_to_delete_finds_missing_tracked_files(self, file_listener, temp_watch_folder):
         current_files = {"still_here.jpg": {"md5": "a"}}
         existing_backup_info = {
             "still_here.jpg": {"md5": "a", "s3_key": "k/still_here.jpg"},
             "gone.jpg": {"md5": "b", "s3_key": "k/gone.jpg"},
         }
 
-        result = file_listener._determine_files_to_delete(current_files, existing_backup_info)
+        result = file_listener._determine_files_to_delete(current_files, existing_backup_info, temp_watch_folder)
 
         assert result == ["gone.jpg"]
 
@@ -419,6 +491,57 @@ class TestFileListenerDeletionPropagation:
         assert "gone.jpg" not in updated["files"]
         assert "keep.jpg" in updated["files"]
         assert file_listener.get_statistics()["deleted_files"] == 1
+
+    async def test_hash_failure_does_not_soft_delete(self, file_listener, mock_s3_manager, temp_watch_folder):
+        """SAFE-01: a file that still exists but failed to hash this scan is not 'deleted'."""
+        folder = temp_watch_folder / "album"
+        folder.mkdir()
+        (folder / "a.jpg").write_text("a")
+        await file_listener._process_current_folder(folder)
+        mock_s3_manager.soft_delete_object.reset_mock()
+
+        # Force a re-hash (mtime changes) that then fails.
+        (folder / "a.jpg").write_text("a changed")
+        file_listener._backup_info_cache.clear()
+        file_listener._backup_info_mtime.clear()
+        file_listener._calculate_md5_sync = lambda _p: None
+
+        await file_listener._process_current_folder(folder)
+
+        mock_s3_manager.soft_delete_object.assert_not_awaited()
+        updated = json.loads((folder / ".milo_backup.info").read_text())
+        assert "a.jpg" in updated["files"]
+
+    async def test_newly_ignored_file_is_not_soft_deleted(self, file_listener, mock_s3_manager, temp_watch_folder):
+        """SAFE-01: adding a .backupignore line must not delete already-backed-up files from S3."""
+        folder = temp_watch_folder / "album"
+        folder.mkdir()
+        (folder / "clip.mov").write_text("video")
+        await file_listener._process_current_folder(folder)
+        mock_s3_manager.soft_delete_object.reset_mock()
+
+        (folder / ".backupignore").write_text("*.mov\n")
+
+        await file_listener._process_current_folder(folder)
+
+        mock_s3_manager.soft_delete_object.assert_not_awaited()
+        updated = json.loads((folder / ".milo_backup.info").read_text())
+        assert "clip.mov" in updated["files"]
+
+    async def test_already_gone_s3_object_clears_entry(self, file_listener, mock_s3_manager, temp_watch_folder):
+        """SAFE-02: a deleted file whose S3 object is already gone must not stay tracked forever."""
+        folder = temp_watch_folder / "album"
+        folder.mkdir()
+        (folder / "gone.jpg").write_text("gone")
+        await file_listener._process_current_folder(folder)
+
+        (folder / "gone.jpg").unlink()
+        mock_s3_manager.soft_delete_object.return_value = True  # S3Manager: absent == success
+
+        await file_listener._process_current_folder(folder)
+
+        updated = json.loads((folder / ".milo_backup.info").read_text())
+        assert "gone.jpg" not in updated["files"]
 
     async def test_failed_soft_delete_keeps_entry_tracked_for_retry(
         self, file_listener, mock_s3_manager, temp_watch_folder
@@ -650,6 +773,22 @@ class TestFileListenerUploads:
         assert isinstance(upload_mtime, float)
         assert upload_mtime > 0.0
         file_listener.s3_manager.upload_file.assert_called_once()
+
+    async def test_upload_single_file_reuses_scan_md5(self, file_listener, temp_watch_folder):
+        """An unchanged file's scan MD5 is reused, so the file isn't read a second time;
+        a changed mtime falls back to re-hashing."""
+        from unittest.mock import AsyncMock
+
+        file_listener._calculate_md5 = AsyncMock(return_value="fresh")
+        mtime = (temp_watch_folder / "file1.txt").stat().st_mtime
+
+        await file_listener._upload_single_file("file1.txt", temp_watch_folder, {"md5": "scan", "mtime": mtime})
+        file_listener._calculate_md5.assert_not_called()
+        assert file_listener.s3_manager.check_exists.call_args.args[1] == "scan"
+
+        await file_listener._upload_single_file("file1.txt", temp_watch_folder, {"md5": "scan", "mtime": mtime - 1})
+        file_listener._calculate_md5.assert_called_once()
+        assert file_listener.s3_manager.check_exists.call_args.args[1] == "fresh"
 
     async def test_upload_single_file_already_exists(self, file_listener, temp_watch_folder):
         """Test uploading a file that already exists in S3 — returns (True, mtime) tuple."""
@@ -968,6 +1107,20 @@ class TestFileListenerAsyncBackupIO:
 
         data = json.loads(backup_file.read_text())
         assert data["files"] == new_format_files
+
+    async def test_update_backup_info_replaces_read_only_file(self, file_listener, tmp_path):
+        """An info file the process can't write (owned by another uid) is replaced via
+        temp file + rename, so the folder isn't re-hashed on every scan."""
+        import json
+        import os
+
+        backup_file = tmp_path / ".milo_backup.info"
+        backup_file.write_text(json.dumps({"files": {}}))
+        os.chmod(backup_file, 0o444)
+        files = {"a.txt": {"md5": "x", "mtime": 1.0}}
+        assert await file_listener._update_backup_info(backup_file, files) is True
+        assert json.loads(backup_file.read_text())["files"] == files
+        assert not (tmp_path / ".milo_backup.info.tmp").exists()
 
     async def test_update_backup_info_retries_on_permission_error_then_succeeds(
         self, file_listener, tmp_path, monkeypatch

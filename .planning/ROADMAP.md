@@ -54,12 +54,35 @@ Plans:
 - [x] 02-04-PLAN.md — FolderWatcher 2-second per-path event debounce [PERF-04]
 - [x] 02-05-PLAN.md — .backupignore cascade in FileListener + main.py lifecycle/credential-source wiring [CONFIG-06]
 
+### Phase 3: Audit Hardening
+**Goal**: Close the data-loss and silent-miss gaps found in the 2026-11-23 ponytail audit — files that are unreadable or newly ignored are never soft-deleted, a failed or unsafe S3 move can no longer erase or strand a file, a file edited mid-scan is never skipped, state writes survive a kill, and the test suite runs hermetically
+**Depends on**: Phase 2
+**Requirements**: TEST-01, SAFE-01, SAFE-02, SAFE-03, SAFE-04, SCAN-01, SCAN-02, S3-01, DUR-01, HYG-01, HYG-02, HYG-03, PERF-09, PERF-10, DEP-01
+**Success Criteria** (what must be TRUE):
+  1. `uv run pytest` passes with something else already bound to port 8765
+  2. A file that fails to hash, or that a new `.backupignore` line now matches, is never moved to `_trash/` while it still exists locally
+  3. After `cp -r A B` of a tracked folder, every file has an S3 object at both `A/...` and `B/...` after one scan
+  4. A renamed folder whose old S3 objects are already gone is uploaded at the new key within the same scan (no endless retry)
+  5. A file modified while being hashed is re-uploaded on the next scan; each changed file is read from disk once for hashing
+  6. A write killed mid-way never leaves a truncated `.milo_backup.info` (verified on the NAS bind mount before shipping)
+**Plans**: 7 plans
+
+Plans:
+- [ ] 03-01-PLAN.md — Hermetic test baseline: web_enabled=False in lifecycle tests, ignore scratchpad/ [TEST-01]
+- [ ] 03-02-PLAN.md — Deletion safety: only truly-missing files are deleted; missing S3 source counts as deleted [SAFE-01, SAFE-02]
+- [ ] 03-03-PLAN.md — Move safety: upload fallback when source is gone; copy-only when old local file still exists [SAFE-03, SAFE-04]
+- [ ] 03-04-PLAN.md — Scan correctness: pre-hash mtime, single hash per file, honest upload verification [SCAN-01, SCAN-02, S3-01]
+- [ ] 03-05-PLAN.md — Atomic .milo_backup.info write, gated by a NAS bind-mount checkpoint [DUR-01]
+- [ ] 03-06-PLAN.md — Hygiene: dashboard bind (needs user decision), delete dev harness, stale docstring [HYG-01, HYG-02, HYG-03]
+- [ ] 03-07-PLAN.md — Cleanup: set lookups, off-loop directory listing, trim dependencies [PERF-09, PERF-10, DEP-01]
+
 ## Progress
 
 **Execution Order:**
-Phases execute in numeric order: 1 → 2
+Phases execute in numeric order: 1 → 2 → 3
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Core Reliability | 0/5 | Not started | - |
 | 2. Performance & Polish | 0/5 | Not started | - |
+| 3. Audit Hardening | 0/7 | Not started | - |

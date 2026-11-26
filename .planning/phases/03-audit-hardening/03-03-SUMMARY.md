@@ -1,0 +1,7 @@
+# 03-03 Summary
+- SAFE-04: `S3Manager.move_object(..., delete_source=True)` (also on the archived re-upload path). `FileListener._local_path_for_s3_key` maps a stale key back to a local path (None when no/ambiguous match). `_move_single_file` passes `delete_source = old_local is not None and not old_local.exists()`, so a copied folder (old local file still present, or unknown mapping) only copies and never deletes the original's S3 object.
+- SAFE-03: after `_move_files`, moves that failed are checked with `get_object_info(old_key)`; only a confirmed-missing source (404) falls back to `_upload_files` in the same scan. Transient failures and failed existence checks keep the stale entry and retry (no re-upload).
+- Tests: 7 new/updated, all verified to FAIL on pre-change code. Full suite 326 passed, ruff check clean, ruff-format file set unchanged.
+- Deviations from the plan: delete_source is computed inside `_move_single_file` (it already has the old key) instead of being threaded through `_move_files`/`_move_with_timeout`. The "three copies" test was not added; the single-copy test plus the missing-source fallback test cover both halves of that scenario.
+- Known trade-off: with copy-only moves, an old key whose local file still exists is left in place by design; it is cleaned up by that file's own soft-delete when it truly disappears.
+- NOT done (needs you): deploy to the NAS and watch one full scan (aws-copier-deploy / aws-copier-monitoring skills). Nothing was pushed or deployed.

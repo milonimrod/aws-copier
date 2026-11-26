@@ -317,6 +317,30 @@ async def test_soft_delete_object_propagates_move_failure(s3_manager):
 
 
 @pytest.mark.asyncio
+async def test_soft_delete_object_missing_source_returns_true(s3_manager):
+    """SAFE-02: an S3 object that is already gone counts as deleted (entry must not be retried forever)."""
+    s3_manager.get_object_info = AsyncMock(return_value=None)
+    s3_manager.move_object = AsyncMock(return_value=False)
+
+    result = await s3_manager.soft_delete_object("Pictures/album/photo.jpg")
+
+    assert result is True
+    s3_manager.move_object.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_object_failed_existence_check_returns_false(s3_manager):
+    """SAFE-02: a network error while checking is NOT 'already gone'."""
+    s3_manager.get_object_info = AsyncMock(side_effect=RuntimeError("timeout"))
+    s3_manager.move_object = AsyncMock(return_value=True)
+
+    result = await s3_manager.soft_delete_object("Pictures/album/photo.jpg")
+
+    assert result is False
+    s3_manager.move_object.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_soft_delete_object_leaves_archived_object_in_place(s3_manager):
     """COST-01: a DEEP_ARCHIVE object can't be copied to _trash/, so it's left where it is."""
     s3_manager.get_object_info = AsyncMock(return_value={"size": 1, "storage_class": "DEEP_ARCHIVE"})
@@ -416,3 +440,19 @@ async def test_ensure_trash_lifecycle_rule_fixes_wrong_prefix(mock_get_session, 
     assert len(trash_rules) == 1
     assert trash_rules[0]["Filter"] == {"Prefix": "test-prefix/_trash/"}
     assert other_rule in rules
+
+
+@pytest.mark.asyncio
+async def test_get_object_info_404_returns_none_but_other_errors_raise(s3_manager):
+    """SAFE-02/SAFE-03: only a 404 means 'confirmed missing'; anything else must propagate."""
+    from botocore.exceptions import ClientError
+
+    client = MagicMock()
+    s3_manager._get_or_create_client = AsyncMock(return_value=client)
+
+    client.head_object = AsyncMock(side_effect=ClientError({"Error": {"Code": "404"}}, "HeadObject"))
+    assert await s3_manager.get_object_info("k") is None
+
+    client.head_object = AsyncMock(side_effect=ClientError({"Error": {"Code": "500"}}, "HeadObject"))
+    with pytest.raises(ClientError):
+        await s3_manager.get_object_info("k")

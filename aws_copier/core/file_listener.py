@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import random
 import sys
 from datetime import datetime
@@ -279,18 +280,33 @@ class FileListener:
         )
 
         # Step 4: Upload changed/new files; receive {filename: upload_mtime} for successful uploads
-        upload_mtimes = await self._upload_files(files_to_upload, folder_path)
+        upload_mtimes = await self._upload_files(files_to_upload, folder_path, current_files)
         uploaded_files = list(upload_mtimes.keys())
 
         # Step 4b (MOVE-01): reconcile renamed/moved files via server-side S3 copy
         moved_files = await self._move_files(files_to_move, existing_backup_info, folder_path)
+
+        # Step 4b' (SAFE-03): a move whose S3 source is confirmed gone can never succeed, and
+        # the file isn't in files_to_upload — without this it would retry forever and never be
+        # backed up at its new key. Transient failures (source still exists) are NOT re-uploaded.
+        failed_moves = [f for f in files_to_move if f not in moved_files]
+        orphaned = []
+        for filename in failed_moves:
+            old_key = (existing_backup_info.get(filename) or {}).get("s3_key")
+            if old_key and await self._source_confirmed_missing(old_key):
+                orphaned.append(filename)
+        if orphaned:
+            logger.info(f"{folder_path}: move source gone from S3 for {len(orphaned)} file(s); uploading instead")
+            extra_mtimes = await self._upload_files(orphaned, folder_path, current_files)
+            upload_mtimes.update(extra_mtimes)
+            uploaded_files.extend(extra_mtimes.keys())
 
         # Step 4c (DEL-01): propagate local deletions to S3 (soft-delete to _trash/), capped
         # by max_deletions_per_scan — a folder with more "missing" files than the cap is
         # treated as suspicious rather than a real bulk deletion, and none are propagated
         # this cycle. They stay fully tracked and get retried every scan until the count
         # drops back under the cap, or the cap is deliberately raised in config.yaml.
-        candidate_deletions = self._determine_files_to_delete(current_files, existing_backup_info)
+        candidate_deletions = self._determine_files_to_delete(current_files, existing_backup_info, folder_path)
         if len(candidate_deletions) > self.config.max_deletions_per_scan:
             logger.warning(
                 f"{folder_path}: {len(candidate_deletions)} previously tracked files are "
@@ -342,15 +358,18 @@ class FileListener:
                     "s3_key": self._build_s3_key(folder_path / filename),
                 }
 
-        # DEL-01: a candidate deletion that wasn't actually propagated (over the safety cap,
-        # or the soft-delete call itself failed) must stay exactly as it was — never
-        # silently dropped, or the s3_key needed to find/clean it up later would be lost.
-        for filename in candidate_deletions:
-            if filename not in deleted_files:
-                updated_backup_info[filename] = existing_backup_info[filename]
+        # DEL-01 / SAFE-01: every existing entry that wasn't rebuilt above and wasn't actually
+        # deleted from S3 must stay exactly as it was — a candidate deletion that wasn't
+        # propagated (over the safety cap, or the soft-delete call failed), and a file that
+        # still exists locally but wasn't captured this scan (hash error, newly ignored).
+        # Dropping any of them would lose the s3_key needed to find/clean it up later.
+        for filename, entry in existing_backup_info.items():
+            if filename not in updated_backup_info and filename not in deleted_files:
+                updated_backup_info[filename] = entry
 
-        if updated_backup_info != existing_backup_info:
-            await self._update_backup_info(backup_info_file, updated_backup_info)
+        if updated_backup_info != existing_backup_info and await self._update_backup_info(
+            backup_info_file, updated_backup_info
+        ):
             logger.info(
                 f"Updated backup info for {folder_path}: {len(uploaded_files)} uploaded, "
                 f"{len(moved_files)} moved, {len(deleted_files)} deleted, "
@@ -585,7 +604,9 @@ class FileListener:
 
         return files_to_upload, files_to_move
 
-    async def _upload_single_file(self, filename: str, folder_path: Path) -> Tuple[bool, float]:
+    async def _upload_single_file(
+        self, filename: str, folder_path: Path, scan_entry: Optional[Dict[str, Any]] = None
+    ) -> Tuple[bool, float]:
         """Upload a single file, capturing st_mtime just before upload (D-02).
 
         CONC-01: does NOT acquire upload_semaphore itself — the caller (_upload_with_timeout)
@@ -596,6 +617,8 @@ class FileListener:
         Args:
             filename: Name of file to upload
             folder_path: Path to folder containing the files
+            scan_entry: This scan's {md5, mtime} for the file; its MD5 is reused when the
+                file's mtime is unchanged, so the file isn't read a second time.
 
         Returns:
             Tuple of (success: bool, upload_mtime: float). upload_mtime is the st_mtime
@@ -609,8 +632,15 @@ class FileListener:
             # Build S3 key relative to watch folder root
             s3_key = self._build_s3_key(file_path)
 
-            # Calculate local MD5
-            local_md5 = await self._calculate_md5(file_path)
+            # Reuse the scan's MD5 unless the file changed since; otherwise calculate it
+            local_md5 = None
+            if scan_entry and scan_entry.get("md5"):
+                try:
+                    if file_path.stat().st_mtime == scan_entry.get("mtime"):
+                        local_md5 = scan_entry["md5"]
+                except OSError:
+                    pass
+            local_md5 = local_md5 or await self._calculate_md5(file_path)
             if not local_md5:
                 logger.error(f"Failed to calculate MD5 for {file_path}")
                 self._stats["errors"] += 1
@@ -649,7 +679,9 @@ class FileListener:
             self._stats["errors"] += 1
             return False, 0.0
 
-    async def _upload_with_timeout(self, filename: str, folder_path: Path) -> Tuple[str, bool, float]:
+    async def _upload_with_timeout(
+        self, filename: str, folder_path: Path, scan_entry: Optional[Dict[str, Any]] = None
+    ) -> Tuple[str, bool, float]:
         """Acquire the upload semaphore, then bound the upload itself in asyncio.wait_for.
 
         ASYNC-02 Pitfall 1 fix: when wait_for was applied to an already-created task
@@ -687,7 +719,7 @@ class FileListener:
         async with self.upload_semaphore:
             try:
                 ok, upload_mtime = await asyncio.wait_for(
-                    self._upload_single_file(filename, folder_path), timeout=timeout
+                    self._upload_single_file(filename, folder_path, scan_entry), timeout=timeout
                 )
                 return filename, bool(ok), upload_mtime
             except asyncio.TimeoutError:
@@ -699,7 +731,12 @@ class FileListener:
                 self._stats["errors"] += 1
                 return filename, False, 0.0
 
-    async def _upload_files(self, files_to_upload: List[str], folder_path: Path) -> Dict[str, float]:
+    async def _upload_files(
+        self,
+        files_to_upload: List[str],
+        folder_path: Path,
+        scan_entries: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, float]:
         """Upload files to S3 concurrently using asyncio.gather.
 
         ASYNC-02 fix: replaces serial-wait_for-in-for-loop with a single gather call so all
@@ -709,6 +746,7 @@ class FileListener:
         Args:
             files_to_upload: List of filenames to upload
             folder_path: Folder containing the files
+            scan_entries: This scan's current_files, so each upload can reuse its MD5
 
         Returns:
             Dict mapping successfully-uploaded filename to the upload_mtime captured just
@@ -725,7 +763,7 @@ class FileListener:
         tasks: List[asyncio.Task] = []
         for filename in files_to_upload:
             task = asyncio.create_task(
-                self._upload_with_timeout(filename, folder_path),
+                self._upload_with_timeout(filename, folder_path, (scan_entries or {}).get(filename)),
                 name=f"upload-{folder_path.name}-{filename}",
             )
             self._active_upload_tasks.add(task)
@@ -778,7 +816,14 @@ class FileListener:
         """
         async with self.upload_semaphore:
             try:
-                ok = await self.s3_manager.move_object(old_s3_key, new_s3_key, local_path=local_path)
+                # SAFE-04: only delete the source key when its local file is known to be gone
+                # (a real rename). If it still exists — or the mapping is unknown — this is a
+                # copied folder, and the source key is that other file's only S3 copy.
+                old_local = self._local_path_for_s3_key(old_s3_key)
+                delete_source = old_local is not None and not old_local.exists()
+                ok = await self.s3_manager.move_object(
+                    old_s3_key, new_s3_key, local_path=local_path, delete_source=delete_source
+                )
                 if not ok:
                     logger.warning(f"Failed to move {filename}: {old_s3_key} -> {new_s3_key}")
                 return ok
@@ -886,23 +931,33 @@ class FileListener:
         return moved_files
 
     def _determine_files_to_delete(
-        self, current_files: Dict[str, Any], existing_backup_info: Dict[str, Any]
+        self, current_files: Dict[str, Any], existing_backup_info: Dict[str, Any], folder_path: Path
     ) -> List[str]:
-        """Find filenames that were tracked before but are no longer present locally.
+        """Find filenames that were tracked before but no longer exist locally.
 
         DEL-01: caller must only call this with a current_files that came from a
         successful (unraised) _scan_current_files() — an unreliable listing must never
         reach here, since every previously-tracked-but-now-"missing" file would be
         misread as a real local deletion.
 
+        SAFE-01: being absent from current_files is NOT proof of deletion — a file whose
+        MD5 failed, or that a new .backupignore line now matches, is absent from it too
+        while still sitting on disk. Only a file that really isn't there anymore counts.
+
         Args:
-            current_files: This scan's actual on-disk files for the folder.
+            current_files: This scan's captured files for the folder.
             existing_backup_info: Previously recorded backup info for the folder.
+            folder_path: Folder being scanned, used to confirm a "missing" file is gone.
 
         Returns:
-            Filenames present in existing_backup_info but absent from current_files.
+            Filenames present in existing_backup_info, absent from current_files, and
+            absent from disk.
         """
-        return [filename for filename in existing_backup_info if filename not in current_files]
+        return [
+            filename
+            for filename in existing_backup_info
+            if filename not in current_files and not (folder_path / filename).exists()
+        ]
 
     async def _delete_single_file(self, filename: str, s3_key: str) -> bool:
         """Soft-delete one file's S3 object (move to _trash/), under the upload semaphore.
@@ -1016,6 +1071,42 @@ class FileListener:
         logger.info(f"Completed S3 deletion propagation: {len(deleted_files)} / {len(files_to_delete)} files")
         return deleted_files
 
+    def _local_path_for_s3_key(self, s3_key: str) -> Optional[Path]:
+        """Map a (prefix-less) S3 key back to the local path it was uploaded from.
+
+        SAFE-04: the inverse of _build_s3_key, used to tell whether the file a stale s3_key
+        points at still exists locally.
+
+        Args:
+            s3_key: Prefix-less S3 key, as recorded in .milo_backup.info
+
+        Returns:
+            The local Path, or None when no watch folder matches or the mapping is ambiguous
+            (two watch folders sharing one S3 name) — callers must treat None as "unknown".
+        """
+        matches = []
+        for watch_folder in self.config.watch_folders:
+            s3_name = self.config.get_s3_name_for_folder(watch_folder)
+            if s3_key.startswith(f"{s3_name}/"):
+                matches.append(watch_folder / s3_key[len(s3_name) + 1 :])
+        return matches[0] if len(matches) == 1 else None
+
+    async def _source_confirmed_missing(self, s3_key: str) -> bool:
+        """True only when S3 definitively reports the object absent (SAFE-03).
+
+        Args:
+            s3_key: Prefix-less S3 key to check
+
+        Returns:
+            False when the object exists OR the check itself failed — a network error must
+            never be read as "the source is gone".
+        """
+        try:
+            return await self.s3_manager.get_object_info(s3_key) is None
+        except Exception as e:
+            logger.warning(f"Could not check whether {s3_key} exists in S3: {e}")
+            return False
+
     def _build_s3_key(self, file_path: Path) -> str:
         """Build S3 key for a file path relative to watch folders.
 
@@ -1066,8 +1157,14 @@ class FileListener:
         for attempt in range(1, max_attempts + 1):
             try:
                 async with self._get_folder_lock(backup_info_file.parent):
-                    async with aiofiles.open(backup_info_file, "w", encoding="utf-8") as f:
+                    # Write a temp file and rename it over the old one: needs only folder write
+                    # access, so an info file owned by another uid (the container runs without
+                    # CAP_DAC_OVERRIDE) no longer blocks the update — which made the whole
+                    # folder re-hash and re-check S3 on every scan. "*.tmp" is ignored by IGNORE_RULES.
+                    tmp_file = backup_info_file.with_name(backup_info_file.name + ".tmp")
+                    async with aiofiles.open(tmp_file, "w", encoding="utf-8") as f:
                         await f.write(json.dumps(backup_info, indent=2))
+                    os.replace(tmp_file, backup_info_file)
                     # PERF-02: update cache with new content; invalidate cached disk mtime so
                     # the next _load_backup_info re-stats and picks up the OS-assigned mtime.
                     self._backup_info_cache[backup_info_file.parent] = backup_files
