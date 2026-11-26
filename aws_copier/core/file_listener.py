@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import random
 import sys
 from datetime import datetime
@@ -279,7 +280,7 @@ class FileListener:
         )
 
         # Step 4: Upload changed/new files; receive {filename: upload_mtime} for successful uploads
-        upload_mtimes = await self._upload_files(files_to_upload, folder_path)
+        upload_mtimes = await self._upload_files(files_to_upload, folder_path, current_files)
         uploaded_files = list(upload_mtimes.keys())
 
         # Step 4b (MOVE-01): reconcile renamed/moved files via server-side S3 copy
@@ -296,7 +297,7 @@ class FileListener:
                 orphaned.append(filename)
         if orphaned:
             logger.info(f"{folder_path}: move source gone from S3 for {len(orphaned)} file(s); uploading instead")
-            extra_mtimes = await self._upload_files(orphaned, folder_path)
+            extra_mtimes = await self._upload_files(orphaned, folder_path, current_files)
             upload_mtimes.update(extra_mtimes)
             uploaded_files.extend(extra_mtimes.keys())
 
@@ -366,8 +367,9 @@ class FileListener:
             if filename not in updated_backup_info and filename not in deleted_files:
                 updated_backup_info[filename] = entry
 
-        if updated_backup_info != existing_backup_info:
-            await self._update_backup_info(backup_info_file, updated_backup_info)
+        if updated_backup_info != existing_backup_info and await self._update_backup_info(
+            backup_info_file, updated_backup_info
+        ):
             logger.info(
                 f"Updated backup info for {folder_path}: {len(uploaded_files)} uploaded, "
                 f"{len(moved_files)} moved, {len(deleted_files)} deleted, "
@@ -602,7 +604,9 @@ class FileListener:
 
         return files_to_upload, files_to_move
 
-    async def _upload_single_file(self, filename: str, folder_path: Path) -> Tuple[bool, float]:
+    async def _upload_single_file(
+        self, filename: str, folder_path: Path, scan_entry: Optional[Dict[str, Any]] = None
+    ) -> Tuple[bool, float]:
         """Upload a single file, capturing st_mtime just before upload (D-02).
 
         CONC-01: does NOT acquire upload_semaphore itself — the caller (_upload_with_timeout)
@@ -613,6 +617,8 @@ class FileListener:
         Args:
             filename: Name of file to upload
             folder_path: Path to folder containing the files
+            scan_entry: This scan's {md5, mtime} for the file; its MD5 is reused when the
+                file's mtime is unchanged, so the file isn't read a second time.
 
         Returns:
             Tuple of (success: bool, upload_mtime: float). upload_mtime is the st_mtime
@@ -626,8 +632,15 @@ class FileListener:
             # Build S3 key relative to watch folder root
             s3_key = self._build_s3_key(file_path)
 
-            # Calculate local MD5
-            local_md5 = await self._calculate_md5(file_path)
+            # Reuse the scan's MD5 unless the file changed since; otherwise calculate it
+            local_md5 = None
+            if scan_entry and scan_entry.get("md5"):
+                try:
+                    if file_path.stat().st_mtime == scan_entry.get("mtime"):
+                        local_md5 = scan_entry["md5"]
+                except OSError:
+                    pass
+            local_md5 = local_md5 or await self._calculate_md5(file_path)
             if not local_md5:
                 logger.error(f"Failed to calculate MD5 for {file_path}")
                 self._stats["errors"] += 1
@@ -666,7 +679,9 @@ class FileListener:
             self._stats["errors"] += 1
             return False, 0.0
 
-    async def _upload_with_timeout(self, filename: str, folder_path: Path) -> Tuple[str, bool, float]:
+    async def _upload_with_timeout(
+        self, filename: str, folder_path: Path, scan_entry: Optional[Dict[str, Any]] = None
+    ) -> Tuple[str, bool, float]:
         """Acquire the upload semaphore, then bound the upload itself in asyncio.wait_for.
 
         ASYNC-02 Pitfall 1 fix: when wait_for was applied to an already-created task
@@ -704,7 +719,7 @@ class FileListener:
         async with self.upload_semaphore:
             try:
                 ok, upload_mtime = await asyncio.wait_for(
-                    self._upload_single_file(filename, folder_path), timeout=timeout
+                    self._upload_single_file(filename, folder_path, scan_entry), timeout=timeout
                 )
                 return filename, bool(ok), upload_mtime
             except asyncio.TimeoutError:
@@ -716,7 +731,12 @@ class FileListener:
                 self._stats["errors"] += 1
                 return filename, False, 0.0
 
-    async def _upload_files(self, files_to_upload: List[str], folder_path: Path) -> Dict[str, float]:
+    async def _upload_files(
+        self,
+        files_to_upload: List[str],
+        folder_path: Path,
+        scan_entries: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, float]:
         """Upload files to S3 concurrently using asyncio.gather.
 
         ASYNC-02 fix: replaces serial-wait_for-in-for-loop with a single gather call so all
@@ -726,6 +746,7 @@ class FileListener:
         Args:
             files_to_upload: List of filenames to upload
             folder_path: Folder containing the files
+            scan_entries: This scan's current_files, so each upload can reuse its MD5
 
         Returns:
             Dict mapping successfully-uploaded filename to the upload_mtime captured just
@@ -742,7 +763,7 @@ class FileListener:
         tasks: List[asyncio.Task] = []
         for filename in files_to_upload:
             task = asyncio.create_task(
-                self._upload_with_timeout(filename, folder_path),
+                self._upload_with_timeout(filename, folder_path, (scan_entries or {}).get(filename)),
                 name=f"upload-{folder_path.name}-{filename}",
             )
             self._active_upload_tasks.add(task)
@@ -1136,8 +1157,14 @@ class FileListener:
         for attempt in range(1, max_attempts + 1):
             try:
                 async with self._get_folder_lock(backup_info_file.parent):
-                    async with aiofiles.open(backup_info_file, "w", encoding="utf-8") as f:
+                    # Write a temp file and rename it over the old one: needs only folder write
+                    # access, so an info file owned by another uid (the container runs without
+                    # CAP_DAC_OVERRIDE) no longer blocks the update — which made the whole
+                    # folder re-hash and re-check S3 on every scan. "*.tmp" is ignored by IGNORE_RULES.
+                    tmp_file = backup_info_file.with_name(backup_info_file.name + ".tmp")
+                    async with aiofiles.open(tmp_file, "w", encoding="utf-8") as f:
                         await f.write(json.dumps(backup_info, indent=2))
+                    os.replace(tmp_file, backup_info_file)
                     # PERF-02: update cache with new content; invalidate cached disk mtime so
                     # the next _load_backup_info re-stats and picks up the OS-assigned mtime.
                     self._backup_info_cache[backup_info_file.parent] = backup_files

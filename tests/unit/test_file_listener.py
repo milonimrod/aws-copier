@@ -774,6 +774,22 @@ class TestFileListenerUploads:
         assert upload_mtime > 0.0
         file_listener.s3_manager.upload_file.assert_called_once()
 
+    async def test_upload_single_file_reuses_scan_md5(self, file_listener, temp_watch_folder):
+        """An unchanged file's scan MD5 is reused, so the file isn't read a second time;
+        a changed mtime falls back to re-hashing."""
+        from unittest.mock import AsyncMock
+
+        file_listener._calculate_md5 = AsyncMock(return_value="fresh")
+        mtime = (temp_watch_folder / "file1.txt").stat().st_mtime
+
+        await file_listener._upload_single_file("file1.txt", temp_watch_folder, {"md5": "scan", "mtime": mtime})
+        file_listener._calculate_md5.assert_not_called()
+        assert file_listener.s3_manager.check_exists.call_args.args[1] == "scan"
+
+        await file_listener._upload_single_file("file1.txt", temp_watch_folder, {"md5": "scan", "mtime": mtime - 1})
+        file_listener._calculate_md5.assert_called_once()
+        assert file_listener.s3_manager.check_exists.call_args.args[1] == "fresh"
+
     async def test_upload_single_file_already_exists(self, file_listener, temp_watch_folder):
         """Test uploading a file that already exists in S3 — returns (True, mtime) tuple."""
         # Configure mock to return True for check_exists
@@ -1091,6 +1107,20 @@ class TestFileListenerAsyncBackupIO:
 
         data = json.loads(backup_file.read_text())
         assert data["files"] == new_format_files
+
+    async def test_update_backup_info_replaces_read_only_file(self, file_listener, tmp_path):
+        """An info file the process can't write (owned by another uid) is replaced via
+        temp file + rename, so the folder isn't re-hashed on every scan."""
+        import json
+        import os
+
+        backup_file = tmp_path / ".milo_backup.info"
+        backup_file.write_text(json.dumps({"files": {}}))
+        os.chmod(backup_file, 0o444)
+        files = {"a.txt": {"md5": "x", "mtime": 1.0}}
+        assert await file_listener._update_backup_info(backup_file, files) is True
+        assert json.loads(backup_file.read_text())["files"] == files
+        assert not (tmp_path / ".milo_backup.info.tmp").exists()
 
     async def test_update_backup_info_retries_on_permission_error_then_succeeds(
         self, file_listener, tmp_path, monkeypatch
